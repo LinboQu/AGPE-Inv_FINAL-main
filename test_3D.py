@@ -60,7 +60,19 @@ def _infer_run_id_for_full_ckpt(model_name: str) -> str:
     return run_id
 
 
-def load_stats_strict(model_name: str, data_flag: str) -> dict:
+def _resolve_run_id_and_model_name(cfg: dict) -> tuple[str, str]:
+    """Resolve a stable run_id / model_name chain with optional run_id_suffix."""
+    suffix = str(cfg.get("run_id_suffix", "") or "")
+    if "run_id" in cfg and cfg["run_id"] is not None and str(cfg["run_id"]).strip() != "":
+        run_id_base = str(cfg["run_id"]).strip()
+    else:
+        run_id_base = _infer_run_id_for_full_ckpt(str(cfg.get("model_name", "")))
+    run_id = run_id_base if (suffix == "" or run_id_base.endswith(suffix)) else f"{run_id_base}{suffix}"
+    model_name = f"{run_id}_s_uns"
+    return run_id, model_name
+
+
+def load_stats_strict(run_id: str, data_flag: str) -> dict:
     """
     Strict stats loading priority:
       1) full_ckpt: save_train_model/{run_id}_full_ckpt_{data_flag}.pth  (BEST)
@@ -69,7 +81,6 @@ def load_stats_strict(model_name: str, data_flag: str) -> dict:
 
     This fully eliminates 'norm_stats_{data_flag}.npy' being overwritten by other runs.
     """
-    run_id = _infer_run_id_for_full_ckpt(model_name)
     full_ckpt_path = join("save_train_model", f"{run_id}_full_ckpt_{data_flag}.pth")
 
     # 1) from full_ckpt
@@ -93,7 +104,7 @@ def load_stats_strict(model_name: str, data_flag: str) -> dict:
         return np.load(p3, allow_pickle=True).item()
 
     raise FileNotFoundError(
-        f"Cannot find stats for model={model_name}, data_flag={data_flag}\n"
+        f"Cannot find stats for run_id={run_id}, data_flag={data_flag}\n"
         f"Tried:\n  {full_ckpt_path}\n  {p2}\n  {p3}"
     )
 
@@ -415,12 +426,15 @@ def test(test_p: dict):
     _ensure_dir("save_train_model")
 
     # 读取配置
-    model_name = test_p["model_name"]
-    data_flag = test_p["data_flag"]
-    no_wells = int(test_p.get("no_wells", 20))
+    cfg = {**TCN1D_train_p, **test_p}
+    run_id, model_name = _resolve_run_id_and_model_name(cfg)
+    data_flag = cfg["data_flag"]
+    no_wells = int(cfg.get("no_wells", 20))
+    print(f"[TEST] resolved run_id={run_id} model_name={model_name}")
+    print(f"[AGPE] backend={cfg.get('aniso_backend', 'grid')} use_tensor_strength={bool(cfg.get('aniso_use_tensor_strength', False))}")
 
     # 合并配置（测试配置覆盖训练配置）
-    cfg = {**TCN1D_train_p, **test_p}
+    # cfg already merged above
 
     ### 1. 读取原始数据（无标准化、无裁剪）
     seismic_raw, model_raw, facies_raw, meta = get_data_raw(data_flag=data_flag)
@@ -454,7 +468,7 @@ def test(test_p: dict):
         print("[SANITY CHECK] 展平/重塑可逆，维度顺序正确！")
 
     ### 3. 加载训练集Stats（优先从full_ckpt读取，杜绝错配）
-    stats = load_stats_strict(model_name=model_name, data_flag=data_flag)
+    stats = load_stats_strict(run_id=run_id, data_flag=data_flag)
     print(f"[NORM] stats loaded | mode={stats.get('mode')} | keys={list(stats.keys())}")
 
     ### 4. 应用训练Stats做标准化（和训练完全一致）
@@ -510,6 +524,9 @@ def test(test_p: dict):
             tau=float(cfg.get("aniso_tau", 0.6)),
             kappa=float(cfg.get("aniso_kappa", 4.0)),
             sigma_st=float(cfg.get("aniso_sigma_st", 1.2)),
+            backend=str(cfg.get("aniso_backend", "grid")),
+            aniso_use_tensor_strength=bool(cfg.get("aniso_use_tensor_strength", False)),
+            aniso_tensor_strength_power=float(cfg.get("aniso_tensor_strength_power", 1.0)),
             use_soft_prior=False,
         )
 

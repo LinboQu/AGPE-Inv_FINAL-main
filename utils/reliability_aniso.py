@@ -21,6 +21,7 @@ In iterative coupling, the recommended pattern is:
 
 import torch
 import torch.nn.functional as F
+from utils.agpe_graph import compute_lattice_edge_weight, get_lattice_edges, graph_diffuse
 
 
 def _sobel_xy(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -52,11 +53,17 @@ def _gauss_blur(x: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
     return x
 
 
-def structure_tensor_orientation(p_channel: torch.Tensor, sigma: float = 1.2, eps: float = 1e-8) -> torch.Tensor:
-    """Compute local dominant direction from structure tensor of p_channel.
+def structure_tensor_orientation_and_strength(
+    p_channel: torch.Tensor,
+    sigma: float = 1.2,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local dominant direction and anisotropy strength from structure tensor.
 
     p_channel: [B,1,H,W] (float, 0..1)
-    returns v: [B,2,H,W] unit vector (vx, vy)
+    returns:
+      v: [B,2,H,W] unit vector (vx, vy)
+      strength: [B,1,H,W] in [0,1], a=(lambda1-lambda2)/(lambda1+lambda2)
     """
     gx, gy = _sobel_xy(p_channel)
     j11 = _gauss_blur(gx * gx, sigma)
@@ -68,6 +75,18 @@ def structure_tensor_orientation(p_channel: torch.Tensor, sigma: float = 1.2, ep
     vy = torch.sin(angle)
     v = torch.cat([vx, vy], dim=1)
     v = v / (torch.sqrt((v * v).sum(dim=1, keepdim=True)) + eps)
+
+    tr = j11 + j22
+    delta = torch.sqrt((j11 - j22) * (j11 - j22) + 4.0 * j12 * j12 + eps)
+    lam1 = 0.5 * (tr + delta)
+    lam2 = 0.5 * (tr - delta)
+    strength = ((lam1 - lam2) / (lam1 + lam2 + eps)).clamp(0.0, 1.0)
+    return v, strength
+
+
+def structure_tensor_orientation(p_channel: torch.Tensor, sigma: float = 1.2, eps: float = 1e-8) -> torch.Tensor:
+    """Backward-compatible orientation-only wrapper."""
+    v, _ = structure_tensor_orientation_and_strength(p_channel, sigma=sigma, eps=eps)
     return v
 
 
@@ -154,6 +173,61 @@ def anisotropic_reliability_2d(
     return R, v
 
 
+@torch.no_grad()
+def graph_lattice_reliability_2d(
+    well_mask: torch.Tensor,  # [B,1,H,W]
+    p_channel: torch.Tensor,  # [B,1,H,W]
+    feat: torch.Tensor | None = None,  # [B,C,H,W]
+    steps: int = 25,
+    eta: float = 0.6,
+    gamma: float = 8.0,
+    tau: float = 0.6,
+    kappa: float = 4.0,
+    sigma_st: float = 1.2,
+    damp: torch.Tensor | None = None,  # [B,1,H,W]
+    use_tensor_strength: bool = True,
+    tensor_strength_power: float = 1.0,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Graph diffusion backend on 8-neighbor lattice with explicit directed edges."""
+    v, strength = structure_tensor_orientation_and_strength(p_channel, sigma=sigma_st, eps=eps)
+
+    bsz, _, il, xl = well_mask.shape
+    src, dst = get_lattice_edges(il=il, xl=xl, diag=True, device=well_mask.device)
+
+    r_out = torch.zeros_like(well_mask)
+    for b in range(bsz):
+        r0 = well_mask[b, 0].reshape(-1)
+        wm = well_mask[b, 0].reshape(-1)
+        pch = p_channel[b, 0].reshape(-1)
+        vf = v[b].permute(1, 2, 0).reshape(-1, 2)
+
+        feat_f = None if feat is None else feat[b].permute(1, 2, 0).reshape(-1, feat.shape[1])
+        damp_f = None if damp is None else damp[b, 0].reshape(-1)
+        str_f = strength[b, 0].reshape(-1) if use_tensor_strength else None
+
+        w = compute_lattice_edge_weight(
+            v_flat=vf,
+            pch_flat=pch,
+            feat_flat=feat_f,
+            damp_flat=damp_f,
+            src=src,
+            dst=dst,
+            il=il,
+            xl=xl,
+            gamma=gamma,
+            tau=tau,
+            kappa=kappa,
+            anis_strength_flat=str_f,
+            strength_power=tensor_strength_power,
+            eps=eps,
+        )
+        r = graph_diffuse(r0, wm, src, dst, w, steps=steps, eta=eta, eps=eps)
+        r_out[b, 0] = r.reshape(il, xl)
+
+    return r_out, v
+
+
 def _ensure_probs(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """If x looks like logits, convert to probs; else assume already probs."""
     # Heuristic: if values outside [0,1] OR row-sum not ~1 => treat as logits.
@@ -191,6 +265,9 @@ def build_R_and_prior_from_cube(
     tau: float = 0.6,
     kappa: float = 4.0,
     sigma_st: float = 1.2,
+    backend: str = "grid",                 # "grid" | "graph_lattice"
+    aniso_use_tensor_strength: bool = True,
+    aniso_tensor_strength_power: float = 1.0,
     # --- physics damping (optional) ---
     phys_residual_3d: torch.Tensor | None = None,  # [H,IL,XL] >=0, larger => harder to propagate
     lambda_phys: float = 0.0,                      # 0 disables
@@ -292,16 +369,32 @@ def build_R_and_prior_from_cube(
         fk = feat[k:k+1]                           # [1,2,IL,XL]
         dk = damp3d[k:k+1].unsqueeze(1) if damp3d is not None else None
 
-        Rk, _ = anisotropic_reliability_2d(
-            wm, pc, fk,
-            steps=steps_R,
-            eta=eta,
-            gamma=gamma,
-            tau=tau,
-            kappa=kappa,
-            sigma_st=sigma_st,
-            damp=dk,
-        )
+        if backend == "grid":
+            Rk, _ = anisotropic_reliability_2d(
+                wm, pc, fk,
+                steps=steps_R,
+                eta=eta,
+                gamma=gamma,
+                tau=tau,
+                kappa=kappa,
+                sigma_st=sigma_st,
+                damp=dk,
+            )
+        elif backend == "graph_lattice":
+            Rk, _ = graph_lattice_reliability_2d(
+                wm, pc, fk,
+                steps=steps_R,
+                eta=eta,
+                gamma=gamma,
+                tau=tau,
+                kappa=kappa,
+                sigma_st=sigma_st,
+                damp=dk,
+                use_tensor_strength=bool(aniso_use_tensor_strength),
+                tensor_strength_power=float(aniso_tensor_strength_power),
+            )
+        else:
+            raise ValueError(f"Unknown backend='{backend}', expected 'grid' or 'graph_lattice'.")
         R_out[k] = Rk[0, 0]
 
         if use_soft_prior and prior is not None:

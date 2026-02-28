@@ -20,7 +20,6 @@ Notes:
 import os
 import csv
 import errno
-import argparse
 from os.path import join
 
 import numpy as np
@@ -204,10 +203,13 @@ def train(train_p: dict):
     seismic, model, facies, meta, stats = get_data_SPF(no_wells=no_wells, data_flag=data_flag, get_F=train_p.get("get_F", 0))
 
     # save stats (both legacy + run-specific)
-    run_id = f"{model_name}_{Forward_model}_{Facies_model_C}"
+    run_id_base = f"{model_name}_{Forward_model}_{Facies_model_C}"
+    run_id_suffix = str(train_p.get("run_id_suffix", "") or "")
+    run_id = run_id_base if (run_id_suffix == "" or run_id_base.endswith(run_id_suffix)) else f"{run_id_base}{run_id_suffix}"
     np.save(join("save_train_model", f"norm_stats_{data_flag}.npy"), stats)  # legacy (may be overwritten)
     np.save(join("save_train_model", f"norm_stats_{run_id}_{data_flag}.npy"), stats)  # strong binding
     print(f"[NORM] saved stats: norm_stats_{run_id}_{data_flag}.npy (and legacy norm_stats_{data_flag}.npy)")
+    print(f"[AGPE] backend={train_p.get('aniso_backend', 'grid')} use_tensor_strength={bool(train_p.get('aniso_use_tensor_strength', False))}")
 
     # -----------------------------
     # Build / maintain anisotropic R(x)
@@ -253,6 +255,9 @@ def train(train_p: dict):
             tau=float(train_p.get("aniso_tau", 0.6)),
             kappa=float(train_p.get("aniso_kappa", 4.0)),
             sigma_st=float(train_p.get("aniso_sigma_st", 1.2)),
+            backend=str(train_p.get("aniso_backend", "grid")),
+            aniso_use_tensor_strength=bool(train_p.get("aniso_use_tensor_strength", False)),
+            aniso_tensor_strength_power=float(train_p.get("aniso_tensor_strength_power", 1.0)),
             use_soft_prior=bool(train_p.get("use_soft_prior", False)),
             steps_prior=int(train_p.get("aniso_steps_prior", 35)),
         )
@@ -442,6 +447,9 @@ def train(train_p: dict):
             tau=float(train_p.get("aniso_tau", 0.6)),
             kappa=float(train_p.get("aniso_kappa", 4.0)),
             sigma_st=float(train_p.get("aniso_sigma_st", 1.2)),
+            backend=str(train_p.get("aniso_backend", "grid")),
+            aniso_use_tensor_strength=bool(train_p.get("aniso_use_tensor_strength", False)),
+            aniso_tensor_strength_power=float(train_p.get("aniso_tensor_strength_power", 1.0)),
             phys_residual_3d=pres_3d if lambda_phys_damp > 0 else None,
             lambda_phys=float(lambda_phys_damp),
             use_soft_prior=False,
