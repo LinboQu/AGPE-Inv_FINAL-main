@@ -39,10 +39,25 @@ TCN1D_train_p = {
     'aniso_tau': 0.6,
     'aniso_kappa': 4.0,
     'aniso_sigma_st': 1.2,
-    'aniso_backend': 'grid',                # grid | graph_lattice
+    'aniso_backend': 'grid',                # grid | graph_lattice | skeleton_graph
     # default False for parity: graph_lattice ~= grid
     'aniso_use_tensor_strength': False,
     'aniso_tensor_strength_power': 1.0,
+    # skeleton graph controls
+    'agpe_skel_p_thresh': 0.60,
+    'agpe_skel_min_nodes': 30,
+    'agpe_skel_snap_radius': 5,
+    'agpe_long_edges': True,
+    'agpe_long_max_step': 6,
+    'agpe_long_step': 2,
+    'agpe_long_cos_thresh': 0.70,
+    'agpe_long_weight': 0.50,
+    'agpe_edge_tau_p': 0.25,
+    'agpe_lift_sigma': 3.0,
+    'agpe_cache_graph': True,
+    'agpe_refine_graph': True,
+    'agpe_rebuild_every': 50,
+    'agpe_topo_change_pch_l1': 0.05,
 
     # optional soft impedance prior
     'use_soft_prior': False,
@@ -86,5 +101,19 @@ TCN1D_test_p = {
     'aniso_backend': 'grid',
     'aniso_use_tensor_strength': False,
     'aniso_tensor_strength_power': 1.0,
+    'agpe_skel_p_thresh': 0.60,
+    'agpe_skel_min_nodes': 30,
+    'agpe_skel_snap_radius': 5,
+    'agpe_long_edges': True,
+    'agpe_long_max_step': 6,
+    'agpe_long_step': 2,
+    'agpe_long_cos_thresh': 0.70,
+    'agpe_long_weight': 0.50,
+    'agpe_edge_tau_p': 0.25,
+    'agpe_lift_sigma': 3.0,
+    'agpe_cache_graph': True,
+    'agpe_refine_graph': True,
+    'agpe_rebuild_every': 50,
+    'agpe_topo_change_pch_l1': 0.05,
 }
 

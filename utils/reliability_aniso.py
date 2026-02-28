@@ -19,9 +19,21 @@ In iterative coupling, the recommended pattern is:
   then R := EMA(R_prev, R_new).
 """
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from utils.agpe_graph import compute_lattice_edge_weight, get_lattice_edges, graph_diffuse
+from utils.agpe_graph import (
+    AGPEGraphCache,
+    build_skeleton_graph,
+    build_cache_for_slice,
+    compute_lattice_edge_weight,
+    get_lattice_edges,
+    graph_diffuse,
+    lift_nodes_to_grid,
+    lift_nodes_to_grid_cached,
+    maybe_rebuild_cache,
+    update_edge_weight_only,
+)
 
 
 def _sobel_xy(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -228,6 +240,246 @@ def graph_lattice_reliability_2d(
     return r_out, v
 
 
+@torch.no_grad()
+def skeleton_graph_reliability_2d(
+    well_mask: torch.Tensor,  # [B,1,H,W]
+    p_channel: torch.Tensor,  # [B,1,H,W]
+    feat: torch.Tensor | None = None,  # [B,C,H,W]
+    conf: torch.Tensor | None = None,  # [B,1,H,W]
+    steps: int = 25,
+    eta: float = 0.6,
+    gamma: float = 8.0,
+    tau: float = 0.6,
+    kappa: float = 4.0,
+    sigma_st: float = 1.2,
+    damp: torch.Tensor | None = None,  # [B,1,H,W]
+    use_tensor_strength: bool = True,
+    tensor_strength_power: float = 1.0,
+    agpe_skel_p_thresh: float = 0.60,
+    agpe_skel_min_nodes: int = 30,
+    agpe_skel_snap_radius: int = 5,
+    agpe_long_edges: bool = True,
+    agpe_long_max_step: int = 6,
+    agpe_long_step: int = 2,
+    agpe_long_cos_thresh: float = 0.70,
+    agpe_long_weight: float = 0.50,
+    agpe_edge_tau_p: float = 0.25,
+    agpe_lift_sigma: float = 3.0,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Skeleton-graph diffusion with fallback to graph_lattice."""
+    v, strength = structure_tensor_orientation_and_strength(p_channel, sigma=sigma_st, eps=eps)
+
+    bsz, _, il, xl = well_mask.shape
+    r_out = torch.zeros_like(well_mask)
+
+    def _fallback_one(bidx: int) -> torch.Tensor:
+        fb, _ = graph_lattice_reliability_2d(
+            well_mask=well_mask[bidx:bidx + 1],
+            p_channel=p_channel[bidx:bidx + 1],
+            feat=None if feat is None else feat[bidx:bidx + 1],
+            steps=steps,
+            eta=eta,
+            gamma=gamma,
+            tau=tau,
+            kappa=kappa,
+            sigma_st=sigma_st,
+            damp=None if damp is None else damp[bidx:bidx + 1],
+            use_tensor_strength=use_tensor_strength,
+            tensor_strength_power=tensor_strength_power,
+            eps=eps,
+        )
+        return fb[0, 0]
+
+    for b in range(bsz):
+        conf_b = conf[b:b + 1] if conf is not None else torch.ones_like(p_channel[b:b + 1])
+        graph = build_skeleton_graph(
+            pch=p_channel[b, 0],
+            conf=conf_b[0, 0],
+            v=v[b],
+            il=il,
+            xl=xl,
+            p_thresh=float(agpe_skel_p_thresh),
+            min_nodes=int(agpe_skel_min_nodes),
+            long_edges=bool(agpe_long_edges),
+            long_max_step=int(agpe_long_max_step),
+            long_step=int(agpe_long_step),
+            long_cos_thresh=float(agpe_long_cos_thresh),
+        )
+        if graph is None or graph["node_rc"].shape[0] == 0 or graph["src"].size == 0:
+            r_out[b, 0] = _fallback_one(b)
+            continue
+
+        node_rc = graph["node_rc"]
+        node_map = graph["node_map"]
+        skel_mask = graph["skel_mask"]
+        src_np = graph["src"]
+        dst_np = graph["dst"]
+        is_long_np = graph["is_long"]
+
+        # map well seeds to skeleton nodes; if none can be snapped, fallback
+        wm_np = (well_mask[b, 0].detach().cpu().numpy() > 0.5)
+        seed_rc = np.argwhere(wm_np)
+        seed_nodes: set[int] = set()
+        snap_radius = max(int(agpe_skel_snap_radius), 0)
+        for r0, c0 in seed_rc:
+            idx = int(node_map[r0, c0])
+            if idx >= 0:
+                seed_nodes.add(idx)
+                continue
+            if snap_radius <= 0:
+                continue
+            rr0 = max(0, int(r0) - snap_radius)
+            rr1 = min(il, int(r0) + snap_radius + 1)
+            cc0 = max(0, int(c0) - snap_radius)
+            cc1 = min(xl, int(c0) + snap_radius + 1)
+            sub = node_map[rr0:rr1, cc0:cc1]
+            cand = np.argwhere(sub >= 0)
+            if cand.size == 0:
+                continue
+            cand[:, 0] += rr0
+            cand[:, 1] += cc0
+            d2 = (cand[:, 0] - int(r0)) ** 2 + (cand[:, 1] - int(c0)) ** 2
+            best = cand[int(np.argmin(d2))]
+            best_idx = int(node_map[int(best[0]), int(best[1])])
+            if best_idx >= 0:
+                seed_nodes.add(best_idx)
+
+        if not seed_nodes:
+            r_out[b, 0] = _fallback_one(b)
+            continue
+
+        device = well_mask.device
+        src = torch.from_numpy(src_np).to(device=device, dtype=torch.long)
+        dst = torch.from_numpy(dst_np).to(device=device, dtype=torch.long)
+        is_long = torch.from_numpy(is_long_np.astype(np.uint8)).to(device=device, dtype=torch.bool)
+
+        rc_t = torch.from_numpy(node_rc).to(device=device, dtype=torch.long)
+        rr = rc_t[:, 0]
+        cc = rc_t[:, 1]
+
+        pch_nodes = p_channel[b, 0, rr, cc]
+        conf_nodes = conf_b[0, 0, rr, cc].clamp(0.0, 1.0)
+        damp_nodes = None if damp is None else damp[b, 0, rr, cc].clamp(0.0, 1.0)
+
+        v_nodes = v[b].permute(1, 2, 0)[rr, cc]
+        v_norm = torch.sqrt((v_nodes * v_nodes).sum(dim=1, keepdim=True) + eps)
+        v_nodes = v_nodes / v_norm
+
+        if use_tensor_strength:
+            strength_nodes = strength[b, 0, rr, cc].clamp(0.0, 1.0).pow(float(tensor_strength_power))
+        else:
+            strength_nodes = torch.ones_like(pch_nodes)
+
+        if feat is None:
+            feat_nodes = None
+        else:
+            feat_nodes = feat[b].permute(1, 2, 0)[rr, cc]  # [M,C]
+
+        src_r = rr[src]
+        src_c = cc[src]
+        dst_r = rr[dst]
+        dst_c = cc[dst]
+
+        dx = (src_c - dst_c).to(pch_nodes.dtype)
+        dy = (src_r - dst_r).to(pch_nodes.dtype)
+        dnorm = torch.sqrt(dx * dx + dy * dy + eps)
+        dx = dx / dnorm
+        dy = dy / dnorm
+
+        cos = dx * v_nodes[dst, 0] + dy * v_nodes[dst, 1]
+        g = torch.sigmoid(float(gamma) * (pch_nodes[dst] - 0.5))
+        if damp_nodes is not None:
+            g = g * damp_nodes[dst]
+        a = torch.exp(float(kappa) * strength_nodes[dst] * (cos * cos))
+
+        if feat_nodes is None:
+            s = torch.ones_like(g)
+        else:
+            dist = torch.sqrt(((feat_nodes[dst] - feat_nodes[src]) ** 2).sum(dim=1) + eps)
+            s = torch.exp(-dist / (float(tau) + eps))
+
+        # edge-level facies-aware penalty + confidence gate
+        edge_tau_p = max(float(agpe_edge_tau_p), eps)
+        p_edge = torch.exp(-torch.abs(pch_nodes[dst] - pch_nodes[src]) / edge_tau_p)
+        p_edge = p_edge * (conf_nodes[dst] * conf_nodes[src])
+
+        w = g * a * s * p_edge
+        if bool(agpe_long_edges):
+            w = torch.where(is_long, w * float(agpe_long_weight), w)
+        w = w.clamp(min=eps)
+
+        m = int(node_rc.shape[0])
+        r0 = torch.zeros((m,), dtype=well_mask.dtype, device=device)
+        wm_node = torch.zeros_like(r0)
+        seed_idx = torch.tensor(sorted(seed_nodes), dtype=torch.long, device=device)
+        r0[seed_idx] = 1.0
+        wm_node[seed_idx] = 1.0
+
+        r_nodes = graph_diffuse(r0, wm_node, src, dst, w, steps=steps, eta=eta, eps=eps)
+        r_grid_np = lift_nodes_to_grid(
+            r_nodes.detach().cpu().numpy().astype(np.float32),
+            node_map=node_map,
+            skel_mask=skel_mask,
+            lift_sigma=float(agpe_lift_sigma),
+        )
+        r_grid = torch.from_numpy(r_grid_np).to(device=device, dtype=well_mask.dtype)
+        r_grid = torch.maximum(r_grid, well_mask[b, 0])
+        r_out[b, 0] = r_grid.clamp(0.0, 1.0)
+
+    return r_out, v
+
+
+def _snap_well_seeds_to_skeleton(
+    well_mask_2d: np.ndarray,
+    node_map: np.ndarray,
+    snap_radius: int,
+) -> tuple[np.ndarray, int, int]:
+    """Map 2D well seeds to skeleton nodes with optional local snapping."""
+    wm_np = np.asarray(well_mask_2d, dtype=np.float32)
+    node_map = np.asarray(node_map, dtype=np.int32)
+    il, xl = node_map.shape
+
+    seed_rc = np.argwhere(wm_np > 0.5)
+    if seed_rc.size == 0:
+        return np.empty((0,), dtype=np.int64), 0, 0
+
+    seed_nodes: set[int] = set()
+    snap_ok = 0
+    r_snap = max(int(snap_radius), 0)
+    for r0, c0 in seed_rc:
+        idx = int(node_map[int(r0), int(c0)])
+        if idx >= 0:
+            seed_nodes.add(idx)
+            snap_ok += 1
+            continue
+        if r_snap <= 0:
+            continue
+
+        rr0 = max(0, int(r0) - r_snap)
+        rr1 = min(il, int(r0) + r_snap + 1)
+        cc0 = max(0, int(c0) - r_snap)
+        cc1 = min(xl, int(c0) + r_snap + 1)
+        sub = node_map[rr0:rr1, cc0:cc1]
+        cand = np.argwhere(sub >= 0)
+        if cand.size == 0:
+            continue
+        cand[:, 0] += rr0
+        cand[:, 1] += cc0
+        d2 = (cand[:, 0] - int(r0)) ** 2 + (cand[:, 1] - int(c0)) ** 2
+        best = cand[int(np.argmin(d2))]
+        best_idx = int(node_map[int(best[0]), int(best[1])])
+        if best_idx >= 0:
+            seed_nodes.add(best_idx)
+            snap_ok += 1
+
+    if not seed_nodes:
+        return np.empty((0,), dtype=np.int64), int(seed_rc.shape[0]), int(snap_ok)
+
+    seed_idx = np.asarray(sorted(seed_nodes), dtype=np.int64)
+    return seed_idx, int(seed_rc.shape[0]), int(snap_ok)
+
+
 def _ensure_probs(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """If x looks like logits, convert to probs; else assume already probs."""
     # Heuristic: if values outside [0,1] OR row-sum not ~1 => treat as logits.
@@ -265,9 +517,27 @@ def build_R_and_prior_from_cube(
     tau: float = 0.6,
     kappa: float = 4.0,
     sigma_st: float = 1.2,
-    backend: str = "grid",                 # "grid" | "graph_lattice"
+    backend: str = "grid",                 # "grid" | "graph_lattice" | "skeleton_graph"
     aniso_use_tensor_strength: bool = True,
     aniso_tensor_strength_power: float = 1.0,
+    # --- skeleton graph params ---
+    agpe_skel_p_thresh: float = 0.60,
+    agpe_skel_min_nodes: int = 30,
+    agpe_skel_snap_radius: int = 5,
+    agpe_long_edges: bool = True,
+    agpe_long_max_step: int = 6,
+    agpe_long_step: int = 2,
+    agpe_long_cos_thresh: float = 0.70,
+    agpe_long_weight: float = 0.50,
+    agpe_edge_tau_p: float = 0.25,
+    agpe_lift_sigma: float = 3.0,
+    agpe_cache_graph: bool = True,
+    agpe_refine_graph: bool = True,
+    agpe_rebuild_every: int = 50,
+    agpe_topo_change_pch_l1: float = 0.05,
+    epoch: int | None = None,
+    graph_cache: AGPEGraphCache | None = None,
+    return_graph_cache: bool = False,
     # --- physics damping (optional) ---
     phys_residual_3d: torch.Tensor | None = None,  # [H,IL,XL] >=0, larger => harder to propagate
     lambda_phys: float = 0.0,                      # 0 disables
@@ -275,12 +545,16 @@ def build_R_and_prior_from_cube(
     use_soft_prior: bool = False,
     steps_prior: int = 35,
     eps: float = 1e-8,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> (
+    tuple[torch.Tensor, torch.Tensor | None]
+    | tuple[torch.Tensor, torch.Tensor | None, AGPEGraphCache]
+):
     """Build R(x) (and optional impedance prior) for the full cube.
 
     Returns:
       R_flat: [N, H] where N=IL*XL, values in [0,1]
       prior_flat (optional): [N,H]
+      graph_cache (optional): only returned when return_graph_cache=True
     """
     device = seismic_3d.device
     H, IL, XL = seismic_3d.shape
@@ -363,15 +637,36 @@ def build_R_and_prior_from_cube(
     else:
         prior = None
 
+    backend_name = str(backend)
+    cache_obj = graph_cache if isinstance(graph_cache, AGPEGraphCache) else AGPEGraphCache()
+    if not bool(agpe_cache_graph):
+        cache_obj.slices.clear()
+
+    graph_stats = {
+        "backend": backend_name,
+        "valid_graph_slices": 0.0,
+        "n_nodes_sum": 0.0,
+        "n_edges_sum": 0.0,
+        "n_long_edges_sum": 0.0,
+        "snap_total": 0.0,
+        "snap_ok": 0.0,
+        "fallback_slices": 0.0,
+        "rebuild_slices": 0.0,
+        "cache_hits": 0.0,
+    }
+
     for k in range(H):
         wm = well_mask_3d[k:k+1].unsqueeze(1)      # [1,1,IL,XL]
         pc = pch[k:k+1].unsqueeze(1)               # [1,1,IL,XL]
         fk = feat[k:k+1]                           # [1,2,IL,XL]
+        ck = conf[k:k+1].unsqueeze(1) if conf is not None else None
         dk = damp3d[k:k+1].unsqueeze(1) if damp3d is not None else None
 
-        if backend == "grid":
+        if backend_name == "grid":
             Rk, _ = anisotropic_reliability_2d(
-                wm, pc, fk,
+                wm,
+                pc,
+                fk,
                 steps=steps_R,
                 eta=eta,
                 gamma=gamma,
@@ -380,9 +675,11 @@ def build_R_and_prior_from_cube(
                 sigma_st=sigma_st,
                 damp=dk,
             )
-        elif backend == "graph_lattice":
+        elif backend_name == "graph_lattice":
             Rk, _ = graph_lattice_reliability_2d(
-                wm, pc, fk,
+                wm,
+                pc,
+                fk,
                 steps=steps_R,
                 eta=eta,
                 gamma=gamma,
@@ -393,8 +690,163 @@ def build_R_and_prior_from_cube(
                 use_tensor_strength=bool(aniso_use_tensor_strength),
                 tensor_strength_power=float(aniso_tensor_strength_power),
             )
+        elif backend_name == "skeleton_graph":
+            v_k, str_k = structure_tensor_orientation_and_strength(pc, sigma=sigma_st, eps=eps)
+            pch_np = pc[0, 0].detach().cpu().numpy().astype(np.float32)
+            conf_np = (
+                ck[0, 0].detach().cpu().numpy().astype(np.float32)
+                if ck is not None
+                else np.ones_like(pch_np, dtype=np.float32)
+            )
+            mask_np = (pch_np >= float(agpe_skel_p_thresh)) & (conf_np > 0.0)
+
+            cache_slice = cache_obj.slices.get(k) if bool(agpe_cache_graph) else None
+            if cache_slice is None:
+                pch_l1 = float("inf")
+            else:
+                prev = cache_slice.pch_prev
+                pch_l1 = float(np.mean(np.abs(pch_np - prev))) if prev.shape == pch_np.shape else float("inf")
+
+            if cache_slice is None:
+                rebuild = True
+            elif bool(agpe_refine_graph):
+                periodic_rebuild = (
+                    (epoch is not None)
+                    and (int(agpe_rebuild_every) > 0)
+                    and (int(epoch) % int(agpe_rebuild_every) == 0)
+                )
+                rebuild = maybe_rebuild_cache(
+                    cache_slice=cache_slice,
+                    new_mask=mask_np,
+                    topo_change_metric=pch_l1,
+                    threshold=float(agpe_topo_change_pch_l1),
+                    force=bool(periodic_rebuild),
+                )
+            else:
+                rebuild = False
+
+            if rebuild:
+                cache_slice = build_cache_for_slice(
+                    pch=pc[0, 0],
+                    conf=ck[0, 0] if ck is not None else None,
+                    v=v_k[0],
+                    il=IL,
+                    xl=XL,
+                    p_thresh=float(agpe_skel_p_thresh),
+                    min_nodes=int(agpe_skel_min_nodes),
+                    long_edges=bool(agpe_long_edges),
+                    long_max_step=int(agpe_long_max_step),
+                    long_step=int(agpe_long_step),
+                    long_cos_thresh=float(agpe_long_cos_thresh),
+                )
+                graph_stats["rebuild_slices"] += 1.0
+                if bool(agpe_cache_graph):
+                    if cache_slice is None:
+                        cache_obj.slices.pop(k, None)
+                    else:
+                        cache_obj.slices[k] = cache_slice
+            else:
+                graph_stats["cache_hits"] += 1.0
+
+            if cache_slice is None or cache_slice.n_nodes <= 0 or cache_slice.n_edges <= 0:
+                Rk, _ = graph_lattice_reliability_2d(
+                    wm,
+                    pc,
+                    fk,
+                    steps=steps_R,
+                    eta=eta,
+                    gamma=gamma,
+                    tau=tau,
+                    kappa=kappa,
+                    sigma_st=sigma_st,
+                    damp=dk,
+                    use_tensor_strength=bool(aniso_use_tensor_strength),
+                    tensor_strength_power=float(aniso_tensor_strength_power),
+                    eps=eps,
+                )
+                graph_stats["fallback_slices"] += 1.0
+            else:
+                seed_idx_np, seed_total, snap_ok = _snap_well_seeds_to_skeleton(
+                    well_mask_2d=wm[0, 0].detach().cpu().numpy(),
+                    node_map=cache_slice.node_map,
+                    snap_radius=int(agpe_skel_snap_radius),
+                )
+                graph_stats["snap_total"] += float(seed_total)
+                graph_stats["snap_ok"] += float(snap_ok)
+                cache_slice.snap_total = int(seed_total)
+                cache_slice.snap_ok = int(snap_ok)
+
+                if seed_idx_np.size == 0:
+                    Rk, _ = graph_lattice_reliability_2d(
+                        wm,
+                        pc,
+                        fk,
+                        steps=steps_R,
+                        eta=eta,
+                        gamma=gamma,
+                        tau=tau,
+                        kappa=kappa,
+                        sigma_st=sigma_st,
+                        damp=dk,
+                        use_tensor_strength=bool(aniso_use_tensor_strength),
+                        tensor_strength_power=float(aniso_tensor_strength_power),
+                        eps=eps,
+                    )
+                    cache_slice.fallback = True
+                    graph_stats["fallback_slices"] += 1.0
+                else:
+                    src, dst, w = update_edge_weight_only(
+                        cache_slice=cache_slice,
+                        pch=pc[0, 0],
+                        conf=ck[0, 0] if ck is not None else None,
+                        v=v_k[0],
+                        strength=str_k[0],
+                        feat=fk[0],
+                        damp=dk[0, 0] if dk is not None else None,
+                        gamma=float(gamma),
+                        tau=float(tau),
+                        kappa=float(kappa),
+                        use_tensor_strength=bool(aniso_use_tensor_strength),
+                        tensor_strength_power=float(aniso_tensor_strength_power),
+                        agpe_edge_tau_p=float(agpe_edge_tau_p),
+                        agpe_long_edges=bool(agpe_long_edges),
+                        agpe_long_weight=float(agpe_long_weight),
+                        eps=eps,
+                    )
+
+                    node_n = int(cache_slice.n_nodes)
+                    r0 = torch.zeros((node_n,), device=device, dtype=torch.float32)
+                    wm_node = torch.zeros_like(r0)
+                    seed_idx = torch.from_numpy(seed_idx_np).to(device=device, dtype=torch.long)
+                    r0[seed_idx] = 1.0
+                    wm_node[seed_idx] = 1.0
+
+                    r_nodes = graph_diffuse(r0, wm_node, src, dst, w, steps=steps_R, eta=eta, eps=eps)
+                    r_grid_np = lift_nodes_to_grid_cached(
+                        r_nodes=r_nodes.detach().cpu().numpy().astype(np.float32),
+                        lift_nearest_idx=cache_slice.lift_nearest_idx,
+                        lift_dist=cache_slice.lift_dist,
+                        lift_sigma=float(agpe_lift_sigma),
+                    )
+                    r_grid = torch.from_numpy(r_grid_np).to(device=device, dtype=torch.float32)
+                    r_grid = torch.maximum(r_grid, wm[0, 0])
+                    Rk = r_grid.unsqueeze(0).unsqueeze(0).clamp(0.0, 1.0)
+
+                    cache_slice.pch_prev = pch_np.copy()
+                    cache_slice.mask = mask_np.copy()
+                    cache_slice.fallback = False
+
+                    graph_stats["valid_graph_slices"] += 1.0
+                    graph_stats["n_nodes_sum"] += float(cache_slice.n_nodes)
+                    graph_stats["n_edges_sum"] += float(cache_slice.n_edges)
+                    graph_stats["n_long_edges_sum"] += float(cache_slice.n_long_edges)
+                    if bool(agpe_cache_graph):
+                        cache_obj.slices[k] = cache_slice
         else:
-            raise ValueError(f"Unknown backend='{backend}', expected 'grid' or 'graph_lattice'.")
+            raise ValueError(
+                f"Unknown backend='{backend_name}', expected 'grid', 'graph_lattice', or 'skeleton_graph'."
+            )
+
         R_out[k] = Rk[0, 0]
 
         if use_soft_prior and prior is not None:
@@ -405,9 +857,9 @@ def build_R_and_prior_from_cube(
                 condn = _neighbor_shift_8(cond)
                 wsum = torch.zeros_like(pk)
                 acc = torch.zeros_like(pk)
-                for w, pnb in zip(condn, pn):
-                    wsum = wsum + w
-                    acc = acc + w * pnb
+                for wv, pnb in zip(condn, pn):
+                    wsum = wsum + wv
+                    acc = acc + wv * pnb
                 pk = acc / (wsum + eps)
                 pk = pk * (1 - wm) + prior[k:k+1].unsqueeze(1) * wm
             prior[k] = pk[0, 0]
@@ -418,4 +870,34 @@ def build_R_and_prior_from_cube(
         prior_flat = prior.reshape(H, N).transpose(0, 1).contiguous()
     else:
         prior_flat = None
+
+    if backend_name == "skeleton_graph":
+        valid = max(float(graph_stats["valid_graph_slices"]), 1.0)
+        edge_sum = float(graph_stats["n_edges_sum"])
+        snap_total = float(graph_stats["snap_total"])
+        graph_stats_out = {
+            "backend": backend_name,
+            "n_nodes_mean": float(graph_stats["n_nodes_sum"]) / valid if graph_stats["valid_graph_slices"] > 0 else 0.0,
+            "n_edges_mean": float(graph_stats["n_edges_sum"]) / valid if graph_stats["valid_graph_slices"] > 0 else 0.0,
+            "long_edge_ratio": float(graph_stats["n_long_edges_sum"]) / max(edge_sum, 1.0),
+            "snap_ok_ratio": float(graph_stats["snap_ok"]) / max(snap_total, 1.0),
+            "fallback_slices": int(graph_stats["fallback_slices"]),
+            "rebuild_slices": int(graph_stats["rebuild_slices"]),
+            "cache_hits": int(graph_stats["cache_hits"]),
+        }
+    else:
+        graph_stats_out = {
+            "backend": backend_name,
+            "n_nodes_mean": 0.0,
+            "n_edges_mean": 0.0,
+            "long_edge_ratio": 0.0,
+            "snap_ok_ratio": 0.0,
+            "fallback_slices": 0,
+            "rebuild_slices": 0,
+            "cache_hits": 0,
+        }
+
+    cache_obj.last_stats = graph_stats_out
+    if return_graph_cache:
+        return R_flat, prior_flat, cache_obj
     return R_flat, prior_flat

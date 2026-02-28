@@ -1,20 +1,17 @@
 """
 test_3D.py (FINAL, drop-in replacement)
 
-功能：
-1) 读取 Stanford VI / Fanny 数据
-2) 加载训练好的模型权重并做全体素推理
-3) 输出定量指标：R2 / PCC / SSIM / PSNR / MSE / MAE / MedAE
-4) 保存可视化结果到 results/：
-   - Pred/True xline=50 剖面
-   - Pred/True inline=100 剖面
-   - Pred/True depth slice = 40/100/160
-   - Seismic xline=50 剖面
-   - 单点 trace 对比
-5) 若开启 use_aniso_conditioning：构建并保存 R(x) 的切片图 + R3D.npy
+Capabilities:
+1) Load Stanford VI / Fanny datasets.
+2) Load trained checkpoints and run full-volume inference.
+3) Report R2 / PCC / SSIM / PSNR / MSE / MAE / MedAE.
+4) Save visualizations to results/:
+   - Pred/True xline=50, inline=100, depth slices 40/100/160
+   - Seismic xline=50 and single-trace comparison
+5) If use_aniso_conditioning=True, save R(x) slices + R3D.npy.
 
-用法（VSCode / F5）：
-- 在 setting.py 里配置 TCN1D_test_p:
+Usage (VSCode / F5):
+- Configure TCN1D_test_p in setting.py:
   - data_flag='Stanford_VI'
   - model_name='VishalNet_cov_para_Facies_s_uns'
   - no_wells=20
@@ -39,8 +36,7 @@ from utils.datasets import SeismicDataset1D
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
 from skimage.metrics import structural_similarity as ssim
-import cv2  # 修正PSNR导入方式（原代码直接from cv2 import PSNR可能报错）
-
+import cv2  # Keep cv2 import style to avoid from-import issues across environments.
 # anisotropic reliability (FARP)
 from utils.reliability_aniso import build_R_and_prior_from_cube
 
@@ -109,7 +105,7 @@ def load_stats_strict(run_id: str, data_flag: str) -> dict:
     )
 
 # -----------------------------
-# 工具函数
+# Utility functions
 # -----------------------------
 def load_selected_wells_trace_indices(
     csv_path: str,
@@ -168,12 +164,12 @@ def load_selected_wells_trace_indices(
     return traces
 
 def _ensure_dir(path: str) -> None:
-    """确保目录存在，不存在则创建"""
+    """Ensure directory exists."""
     os.makedirs(path, exist_ok=True)
 
 
 def _percentile_vminmax(arr: np.ndarray, p_low=1, p_high=99):
-    """计算数组的百分位数极值（用于可视化的vmin/vmax）"""
+    """Compute robust vmin/vmax using percentiles."""
     vmin = np.percentile(arr, p_low)
     vmax = np.percentile(arr, p_high)
     return float(vmin), float(vmax)
@@ -181,17 +177,17 @@ def _percentile_vminmax(arr: np.ndarray, p_low=1, p_high=99):
 
 def get_data_raw(data_flag='Stanford_VI'):
     """
-    仅读取原始数据，不做任何标准化/裁剪操作
-    输出：
-      seismic_raw: (N, H)  原始地震数据（未标准化）
-      model_raw  : (N, H)  原始模型数据（未标准化）
-      facies_raw : (N, H)  原始地震相数据
+    Load raw data only (no standardization or cropping).
+    Returns:
+      seismic_raw: (N, H) raw seismic
+      model_raw  : (N, H) raw target model
+      facies_raw : (N, H) raw facies
       meta       : dict(H, inline, xline, seismic3d, model3d, facies3d)
     """
     meta = {}
 
     if data_flag == 'Stanford_VI':
-        # 读取原始3D数据 (H, IL, XL)
+        # Load raw 3D cubes with shape (H, IL, XL).
         seismic3d = np.load(join('data', data_flag, 'synth_40HZ.npy'))
         model3d = np.load(join('data', data_flag, 'AI.npy'))
         facies3d = np.load(join('data', data_flag, 'Facies.npy'))
@@ -202,34 +198,34 @@ def get_data_raw(data_flag='Stanford_VI'):
             'seismic3d': seismic3d, 'model3d': model3d, 'facies3d': facies3d
         }
 
-        # 展平为trace维度：(H, IL*XL) -> (IL*XL, H)
+        # Flatten to trace dimension: (H, IL*XL) -> (IL*XL, H)
         seismic_raw = np.transpose(seismic3d.reshape(H, IL * XL), (1, 0))
         model_raw = np.transpose(model3d.reshape(H, IL * XL), (1, 0))
         facies_raw = np.transpose(facies3d.reshape(H, IL * XL), (1, 0))
 
-        print(f"[{data_flag}] 原始数据维度: model={model_raw.shape}, seismic={seismic_raw.shape}, facies={facies_raw.shape}")
-        print(f"[{data_flag}] 原始数据均值: model={float(model_raw.mean()):.4f}, seismic={float(seismic_raw.mean()):.4f}")
+        print(f"[{data_flag}] raw shapes: model={model_raw.shape}, seismic={seismic_raw.shape}, facies={facies_raw.shape}")
+        print(f"[{data_flag}] raw means: model={float(model_raw.mean()):.4f}, seismic={float(seismic_raw.mean()):.4f}")
 
     elif data_flag == 'Fanny':
-        # 兼容Fanny数据集（保持和训练一致的原始读取逻辑）
+        # Fanny raw-data loading branch (kept consistent with training logic).
         seismic_raw = np.load(join('data', data_flag, 'seismic.npy'))
         GR_raw = np.load(join('data', data_flag, 'GR.npy'))
         model_raw = np.load(join('data', data_flag, 'Impedance.npy'))
         facies_raw = np.load(join('data', data_flag, 'facies.npy'))
-        # 目标可以是GR（和训练一致）
+        # Use GR as inversion target (consistent with training).
         model_raw = GR_raw
-        # 自动计算Fanny的inline/xline（假设是正方形）
+        # Infer Fanny inline/xline assuming a square grid of traces.
         n_traces = model_raw.shape[0]
         IL = XL = int(np.sqrt(n_traces))
         meta = {
             'H': model_raw.shape[-1], 'inline': IL, 'xline': XL,
-            'seismic3d': seismic_raw.reshape(IL, XL, -1).transpose(2,0,1),  # 适配3D格式
+            'seismic3d': seismic_raw.reshape(IL, XL, -1).transpose(2,0,1),  # Adapt to (H, IL, XL)
             'model3d': model_raw.reshape(IL, XL, -1).transpose(2,0,1)
         }
-        print(f"[{data_flag}] 原始数据维度: model={model_raw.shape}, seismic={seismic_raw.shape}")
+        print(f"[{data_flag}] raw shapes: model={model_raw.shape}, seismic={seismic_raw.shape}")
 
     else:
-        raise ValueError(f"不支持的数据集: {data_flag}")
+        raise ValueError(f"Unsupported dataset: {data_flag}")
 
     return seismic_raw, model_raw, facies_raw, meta
 
@@ -245,39 +241,39 @@ def show_stanford_vi(
     depth_slices=(40, 100, 160),
 ):
     """
-    可视化Stanford VI的预测/真实剖面和切片
-    适配自检后的reshape order，解决竖直条带问题
+    Visualize Stanford VI predictions/ground truth slices and sections.
+    Adapt to the verified reshape order to avoid stripe artifacts.
     """
     _ensure_dir("results")
 
     H = int(meta["H"])
     IL = int(meta["inline"])
     XL = int(meta["xline"])
-    # 从meta中获取自检后的reshape顺序（C/F）
+    # Use reshape order inferred by the sanity-check; default to C-order.
     reshape_order = meta.get("reshape_order", "C")
 
-    # 关键：使用正确的reshape order重塑为3D
+    # Reshape back to 3D using the validated reshape order.
     AI_act = AI_act_flat.reshape(IL, XL, H, order=reshape_order)
     AI_pred = AI_pred_flat.reshape(IL, XL, H, order=reshape_order)
 
-    # 处理地震数据的reshape
+    # Reshape seismic input consistently.
     if seismic_flat.ndim == 3:
         seis_amp = seismic_flat[:, 0, :].reshape(IL, XL, H, order=reshape_order)
     else:
         seis_amp = seismic_flat.reshape(IL, XL, H, order=reshape_order)
 
-    # 添加轻微噪声提升可视化效果（和原始数据风格一致）
+    # Add light texture noise for clearer seismic visualization.
     blurred = ndimage.gaussian_filter(seis_amp, sigma=1.1)
     seis_plot = blurred + 0.5 * blurred.std() * np.random.random(blurred.shape)
 
-    # 坐标转换（索引→米，IL/XL每格25米）
+    # Convert index axes to distance (25 m per inline/xline step).
     il_dist = IL * 25
     xl_dist = XL * 25
 
-    # 基于真实值计算robust的vmin/vmax
+    # Use robust color limits from ground truth percentiles.
     vmin, vmax = _percentile_vminmax(AI_act, 1, 99)
 
-    # -------- Pred xline 剖面 --------
+    # -------- Pred xline section --------
     xline_pick = int(np.clip(xline_pick, 0, XL - 1))
     fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
     ax.imshow(AI_pred[:, xline_pick, :].T, vmin=vmin, vmax=vmax, extent=(0, il_dist, H, 0))
@@ -291,7 +287,7 @@ def show_stanford_vi(
     plt.savefig(f"results/{out_prefix}_Pred_xline_{xline_pick}.png", bbox_inches='tight')
     plt.close()
 
-    # -------- Pred inline 剖面 --------
+    # -------- Pred inline section --------
     inline_pick = int(np.clip(inline_pick, 0, IL - 1))
     fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
     ax.imshow(AI_pred[inline_pick, :, :].T, vmin=vmin, vmax=vmax, extent=(0, xl_dist, H, 0))
@@ -305,7 +301,7 @@ def show_stanford_vi(
     plt.savefig(f"results/{out_prefix}_Pred_inline_{inline_pick}.png", bbox_inches='tight')
     plt.close()
 
-    # -------- Pred depth 切片 --------
+    # -------- Pred depth slice --------
     for z in depth_slices:
         z = int(np.clip(z, 0, H - 1))
         fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
@@ -319,7 +315,7 @@ def show_stanford_vi(
         plt.savefig(f"results/{out_prefix}_Pred_depth_{z}.png", bbox_inches='tight')
         plt.close()
 
-    # -------- True xline 剖面 --------
+    # -------- True xline section --------
     fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
     ax.imshow(AI_act[:, xline_pick, :].T, vmin=vmin, vmax=vmax, extent=(0, il_dist, H, 0))
     ax.xaxis.set_major_locator(MultipleLocator(1000))
@@ -332,7 +328,7 @@ def show_stanford_vi(
     plt.savefig(f"results/{out_prefix}_True_xline_{xline_pick}.png", bbox_inches='tight')
     plt.close()
 
-    # -------- True inline 剖面 --------
+    # -------- True inline section --------
     fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
     ax.imshow(AI_act[inline_pick, :, :].T, vmin=vmin, vmax=vmax, extent=(0, xl_dist, H, 0))
     ax.xaxis.set_major_locator(MultipleLocator(1000))
@@ -345,7 +341,7 @@ def show_stanford_vi(
     plt.savefig(f"results/{out_prefix}_True_inline_{inline_pick}.png", bbox_inches='tight')
     plt.close()
 
-    # -------- True depth 切片 --------
+    # -------- True depth slice --------
     for z in depth_slices:
         z = int(np.clip(z, 0, H - 1))
         fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
@@ -359,7 +355,7 @@ def show_stanford_vi(
         plt.savefig(f"results/{out_prefix}_True_depth_{z}.png", bbox_inches='tight')
     plt.close()
 
-    # -------- Seismic xline 剖面 --------
+    # -------- Seismic xline section --------
     fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
     ax.imshow(seis_plot[:, xline_pick, :].T, cmap="seismic", extent=(0, il_dist, H, 0))
     ax.xaxis.set_major_locator(MultipleLocator(1000))
@@ -372,7 +368,7 @@ def show_stanford_vi(
     plt.savefig(f"results/{out_prefix}_Seismic_xline_{xline_pick}.png", bbox_inches='tight')
     plt.close()
 
-    # -------- 单点 Trace 对比 --------
+    # -------- Single-trace comparison --------
     B_x, B_y = inline_pick, xline_pick
     depth_index = np.arange(H) * 1.0
 
@@ -392,7 +388,7 @@ def show_stanford_vi(
 
 def save_R_visualization(R_flat_torch: torch.Tensor, meta: dict, out_prefix: str, depth_slices=(40, 100, 160)):
     """
-    可视化并保存R(x)的3D数据和切片，适配正确的reshape order
+    Visualize and save R(x) 3D data and depth slices with consistent reshape order.
     """
     _ensure_dir("results")
     H = int(meta["H"])
@@ -400,13 +396,13 @@ def save_R_visualization(R_flat_torch: torch.Tensor, meta: dict, out_prefix: str
     XL = int(meta["xline"])
     reshape_order = meta.get("reshape_order", "C")
 
-    # 用正确的order重塑R数据
+    # Reshape R data using the validated order.
     R3d = R_flat_torch.detach().cpu().numpy().reshape(IL, XL, H, order=reshape_order)
-    # 保存两种维度顺序的R3D数据
+    # Save both IL-XL-H and H-IL-XL layouts.
     np.save(f"results/{out_prefix}_R3d_ILXLH.npy", R3d)
     np.save(f"results/{out_prefix}_R3d_HILXL.npy", np.transpose(R3d, (2, 0, 1)))
 
-    # 保存R(x)深度切片
+    # Save depth slices of R(x).
     for z in depth_slices:
         z = int(np.clip(z, 0, H - 1))
         plt.figure(figsize=(6, 5), dpi=250)
@@ -419,13 +415,12 @@ def save_R_visualization(R_flat_torch: torch.Tensor, meta: dict, out_prefix: str
 
 
 # -----------------------------
-# 主测试函数
-# -----------------------------
-def test(test_p: dict):
+# Main test function
+def test(test_p: dict) -> dict:
     _ensure_dir("results")
     _ensure_dir("save_train_model")
 
-    # 读取配置
+    # Read config.
     cfg = {**TCN1D_train_p, **test_p}
     run_id, model_name = _resolve_run_id_and_model_name(cfg)
     data_flag = cfg["data_flag"]
@@ -433,65 +428,65 @@ def test(test_p: dict):
     print(f"[TEST] resolved run_id={run_id} model_name={model_name}")
     print(f"[AGPE] backend={cfg.get('aniso_backend', 'grid')} use_tensor_strength={bool(cfg.get('aniso_use_tensor_strength', False))}")
 
-    # 合并配置（测试配置覆盖训练配置）
+    # Merge train/test config (test fields override training defaults).
     # cfg already merged above
 
-    ### 1. 读取原始数据（无标准化、无裁剪）
+    ### 1. Load raw data (no standardization/cropping yet)
     seismic_raw, model_raw, facies_raw, meta = get_data_raw(data_flag=data_flag)
 
-    ### 2. Trace顺序自检（核心！解决竖直条带问题）
+    ### 2. Trace-order sanity check
     IL, XL, H = meta["inline"], meta["xline"], meta["H"]
-    # 验证flatten/reshape可逆性
+    # Verify flatten/reshape reversibility under current order.
     model_3d = model_raw.reshape(IL, XL, H)
     model_back = model_3d.reshape(IL * XL, H)
     reshape_err = np.abs(model_back - model_raw).max()
-    print(f"[SANITY CHECK] flatten/reshape 最大误差: {reshape_err:.6f}")
+    print(f"[SANITY CHECK] flatten/reshape max error: {reshape_err:.6f}")
     
-    # 异常处理：自动适配C/F order
+    # If needed, auto-switch between C/F reshape orders.
     if reshape_err > 1e-10:
-        print("[WARNING] 展平/重塑不可逆！尝试Fortran顺序（order='F'）修正...")
+        print("[WARNING] flatten/reshape is not reversible; trying Fortran order (order='F').")
         model_3d_F = model_raw.reshape(IL, XL, H, order='F')
         model_back_F = model_3d_F.reshape(IL * XL, H, order='F')
         reshape_err_F = np.abs(model_back_F - model_raw).max()
-        print(f"[SANITY CHECK] 修正后最大误差: {reshape_err_F:.6f}")
+        print(f"[SANITY CHECK] max error after Fortran-order check: {reshape_err_F:.6f}")
         
         if reshape_err_F < 1e-10:
             meta["reshape_order"] = "F"
-            print("[SANITY CHECK] 修正成功！使用Fortran顺序（列优先）reshape")
+            print("[SANITY CHECK] fixed: using Fortran-order reshape.")
         else:
             raise RuntimeError(
-                f"展平/重塑始终不可逆！原始误差={reshape_err:.6f}, 修正后={reshape_err_F:.6f} \n"
-                f"请检查维度：IL={IL}, XL={XL}, H={H}, model_raw.shape={model_raw.shape}"
+                f"flatten/reshape remains non-reversible: raw_err={reshape_err:.6f}, fixed_err={reshape_err_F:.6f}\n"
+                f"Please verify dims: IL={IL}, XL={XL}, H={H}, model_raw.shape={model_raw.shape}"
             )
     else:
         meta["reshape_order"] = "C"
-        print("[SANITY CHECK] 展平/重塑可逆，维度顺序正确！")
+        print("[SANITY CHECK] flatten/reshape reversible; using C-order.")
 
-    ### 3. 加载训练集Stats（优先从full_ckpt读取，杜绝错配）
+    ### 3. Load training normalization stats (prefer full_ckpt to avoid mismatches)
     stats = load_stats_strict(run_id=run_id, data_flag=data_flag)
     print(f"[NORM] stats loaded | mode={stats.get('mode')} | keys={list(stats.keys())}")
 
-    ### 4. 应用训练Stats做标准化（和训练完全一致）
+    ### 4. Standardize using training stats
     seismic, model, _ = standardize(seismic_raw, model_raw, stats=stats)
 
-    ### 5. 裁剪到8的倍数（适配UNet/TCN下采样）
+    ### 5. Crop to multiples of 8 (UNet/TCN downsampling compatibility)
     s_L = seismic.shape[-1]
     n = int((s_L // 8) * 8)
     seismic = seismic[:, :n]
     model = model[:, :n]
     facies = facies_raw[:, :n]
 
-    ### 6. 添加通道维度（和训练一致）
+    ### 6. Add channel dimension (same as training)
     seismic = seismic[:, np.newaxis, :].astype(np.float32)  # (N,1,H)
     model = model[:, np.newaxis, :].astype(np.float32)
     facies = facies[:, np.newaxis, :]
 
-    ### 7. 构建各向异性R通道（若开启）
+    ### 7. Build anisotropic R channel (if enabled)
     R_flat = None
     if cfg.get("use_aniso_conditioning", False) and data_flag == "Stanford_VI":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # ✅ 真实井点作为种子（从CSV读取 INLINE/XLINE）
+        # Use selected real well locations from CSV as AGPE seeds.
         seed = int(cfg.get("seed", 2026))
         csv_path = cfg.get("selected_wells_csv", None)
         
@@ -506,12 +501,12 @@ def test(test_p: dict):
         np.save(f"results/{model_name}_{data_flag}_well_trace_indices.npy", traces_well)
 
         well_idx = torch.from_numpy(traces_well).to(device)
-        # 加载3D数据到设备
+        # Move 3D cubes to device.
         seis3d = torch.from_numpy(meta["seismic3d"]).to(device=device, dtype=torch.float32)
         fac3d = torch.from_numpy(meta["facies3d"]).to(device=device, dtype=torch.long)
         ai3d = torch.from_numpy(meta["model3d"]).to(device=device, dtype=torch.float32)
 
-        # 构建R(x)
+        # Build R(x).
         R_flat, _ = build_R_and_prior_from_cube(
             seismic_3d=seis3d,
             facies_3d=fac3d,
@@ -527,34 +522,44 @@ def test(test_p: dict):
             backend=str(cfg.get("aniso_backend", "grid")),
             aniso_use_tensor_strength=bool(cfg.get("aniso_use_tensor_strength", False)),
             aniso_tensor_strength_power=float(cfg.get("aniso_tensor_strength_power", 1.0)),
+            agpe_skel_p_thresh=float(cfg.get("agpe_skel_p_thresh", 0.60)),
+            agpe_skel_min_nodes=int(cfg.get("agpe_skel_min_nodes", 30)),
+            agpe_skel_snap_radius=int(cfg.get("agpe_skel_snap_radius", 5)),
+            agpe_long_edges=bool(cfg.get("agpe_long_edges", True)),
+            agpe_long_max_step=int(cfg.get("agpe_long_max_step", 6)),
+            agpe_long_step=int(cfg.get("agpe_long_step", 2)),
+            agpe_long_cos_thresh=float(cfg.get("agpe_long_cos_thresh", 0.70)),
+            agpe_long_weight=float(cfg.get("agpe_long_weight", 0.50)),
+            agpe_edge_tau_p=float(cfg.get("agpe_edge_tau_p", 0.25)),
+            agpe_lift_sigma=float(cfg.get("agpe_lift_sigma", 3.0)),
             use_soft_prior=False,
         )
 
-        # 拼接R通道到地震数据
+        # Append anisotropic reliability channel R(x) to seismic input.
         R_np = R_flat.detach().cpu().numpy()[:, np.newaxis, :].astype(np.float32)
         seismic = np.concatenate([seismic, R_np], axis=1)  # (N,2,H)
 
-        # 保存R(x)可视化
+        # Save R(x) visualization.
         out_prefix = f"{model_name}_{data_flag}"
         save_R_visualization(R_flat, meta, out_prefix, depth_slices=(40, 100, 160))
 
-    print(f"[TEST] 最终输入维度: seismic={seismic.shape}, model={model.shape}")
+    print(f"[TEST] final input shapes: seismic={seismic.shape}, model={model.shape}")
 
-    ### 8. 构建DataLoader
+    ### 8. Build DataLoader
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     traces_test = np.arange(len(model), dtype=int)
     test_dataset = SeismicDataset1D(seismic, model, traces_test)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    ### 9. 加载模型
+    ### 9. Load model
     ckpt_path = f"save_train_model/{model_name}_{data_flag}.pth"
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), ckpt_path)
-    print(f"[TEST] 加载模型: {ckpt_path}")
+    print(f"[TEST] loading model: {ckpt_path}")
     inver_model = torch.load(ckpt_path, map_location=device).to(device)
 
-    ### 10. 全体素推理
-    print("[TEST] 推理中 ...")
+    ### 10. Full-volume inference
+    print("[TEST] inferencing...")
     x0, y0 = test_dataset[0]
     H = y0.shape[-1]
 
@@ -570,31 +575,31 @@ def test(test_p: dict):
             y_pred = inver_model(x)
 
             bs = x.shape[0]
-            # 适配不同的输出维度
+            # Handle both (B,1,H) and (B,H) model outputs.
             AI_pred[mem:mem + bs] = y_pred.squeeze(1) if y_pred.ndim == 3 else y_pred
             AI_act[mem:mem + bs] = y.squeeze(1) if y.ndim == 3 else y
             mem += bs
 
-    # 转换为numpy
+    # Convert to numpy.
     AI_pred_np = AI_pred.detach().cpu().numpy()
     AI_act_np = AI_act.detach().cpu().numpy()
 
-    # 保存预测/真实数据
+    # Save predicted/ground-truth arrays.
     out_prefix = f"{model_name}_{data_flag}"
     np.save(f"results/{out_prefix}_pred_AI.npy", AI_pred_np)
     np.save(f"results/{out_prefix}_true_AI.npy", AI_act_np)
 
-    ### 11. 计算定量指标
-    print("\n[TEST] 定量评估指标:")
-    # R² 得分
+    ### 11. Compute quantitative metrics
+    print("\n[TEST] quantitative metrics:")
+    # R2 score
     r2 = r2_score(AI_act_np.ravel(), AI_pred_np.ravel())
-    print(f"  R² 得分   : {r2:.4f}")
+    print(f"  R2        : {r2:.4f}")
     
-    # 皮尔逊相关系数（PCC）
+    # Pearson correlation coefficient (PCC).
     pcc, p_value = pearsonr(AI_act_np.ravel(), AI_pred_np.ravel())
     print(f"  PCC       : {pcc:.4f} (p-value: {p_value:.2e})")
     
-    # SSIM（结构相似性）
+    # SSIM (structural similarity)
     dr = AI_act_np.max() - AI_act_np.min() + 1e-12
     ssim_score = ssim(AI_act_np.T, AI_pred_np.T, data_range=dr)
     print(f"  SSIM      : {ssim_score:.4f}")
@@ -607,12 +612,26 @@ def test(test_p: dict):
     print(f"  MAE       : {mae:.4f}")
     print(f"  MedAE     : {medae:.4f}")
     
-    # PSNR（峰值信噪比）
+    # PSNR (peak signal-to-noise ratio).
     dr_full = max(AI_act_np.max(), AI_pred_np.max()) - min(AI_act_np.min(), AI_pred_np.min()) + 1e-12
     psnr = 20 * np.log10(dr_full) - 10 * np.log10(mse + 1e-12)
     print(f"  PSNR      : {psnr:.4f} dB")
 
-    ### 12. 可视化结果
+    metrics = {
+        "run_id": run_id,
+        "model_name": model_name,
+        "data_flag": data_flag,
+        "r2": float(r2),
+        "pcc": float(pcc),
+        "p_value": float(p_value),
+        "ssim": float(ssim_score),
+        "mse": float(mse),
+        "mae": float(mae),
+        "medae": float(medae),
+        "psnr": float(psnr),
+    }
+
+    # 12. Visualization
     if data_flag == "Stanford_VI":
         show_stanford_vi(
             AI_act_flat=AI_act_np,
@@ -624,10 +643,13 @@ def test(test_p: dict):
             inline_pick=100,
             depth_slices=(40, 100, 160),
         )
-        print(f"\n[TEST] 可视化结果已保存到 results/ 目录，前缀: {out_prefix}")
+        print(f"\n[TEST] visualizations saved to results/ with prefix: {out_prefix}")
     else:
-        print("\n[TEST] Fanny数据集可视化可按需扩展")
+        print("\n[TEST] Fanny visualization is not expanded in this script.")
 
+
+    return metrics
 
 if __name__ == "__main__":
     test(TCN1D_test_p)
+

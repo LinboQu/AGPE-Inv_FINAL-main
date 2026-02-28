@@ -216,6 +216,9 @@ def train(train_p: dict):
     # -----------------------------
     R_prev_flat = None
     prior_np = None
+    agpe_cache = None
+    aniso_backend = str(train_p.get("aniso_backend", "grid"))
+    want_graph_cache = aniso_backend == "skeleton_graph"
 
     if train_p.get("use_aniso_conditioning", False) and data_flag == "Stanford_VI":
         H, IL, XL = int(meta["H"]), int(meta["inline"]), int(meta["xline"])
@@ -234,7 +237,7 @@ def train(train_p: dict):
         p0_3d = (fac_prior3d == ch_id).float()          # [H,IL,XL] in {0,1}
         conf0_3d = torch.ones_like(p0_3d)               # [H,IL,XL] all confident
         
-        R_prev_flat, prior_flat = build_R_and_prior_from_cube(
+        r0_out = build_R_and_prior_from_cube(
             seismic_3d=seis3d,
             ai_3d=ai3d,
             well_trace_indices=well_idx,
@@ -258,9 +261,30 @@ def train(train_p: dict):
             backend=str(train_p.get("aniso_backend", "grid")),
             aniso_use_tensor_strength=bool(train_p.get("aniso_use_tensor_strength", False)),
             aniso_tensor_strength_power=float(train_p.get("aniso_tensor_strength_power", 1.0)),
+            agpe_skel_p_thresh=float(train_p.get("agpe_skel_p_thresh", 0.60)),
+            agpe_skel_min_nodes=int(train_p.get("agpe_skel_min_nodes", 30)),
+            agpe_skel_snap_radius=int(train_p.get("agpe_skel_snap_radius", 5)),
+            agpe_long_edges=bool(train_p.get("agpe_long_edges", True)),
+            agpe_long_max_step=int(train_p.get("agpe_long_max_step", 6)),
+            agpe_long_step=int(train_p.get("agpe_long_step", 2)),
+            agpe_long_cos_thresh=float(train_p.get("agpe_long_cos_thresh", 0.70)),
+            agpe_long_weight=float(train_p.get("agpe_long_weight", 0.50)),
+            agpe_edge_tau_p=float(train_p.get("agpe_edge_tau_p", 0.25)),
+            agpe_lift_sigma=float(train_p.get("agpe_lift_sigma", 3.0)),
+            agpe_cache_graph=bool(train_p.get("agpe_cache_graph", True)),
+            agpe_refine_graph=bool(train_p.get("agpe_refine_graph", True)),
+            agpe_rebuild_every=int(train_p.get("agpe_rebuild_every", 50)),
+            agpe_topo_change_pch_l1=float(train_p.get("agpe_topo_change_pch_l1", 0.05)),
+            epoch=0,
+            graph_cache=agpe_cache,
+            return_graph_cache=bool(want_graph_cache),
             use_soft_prior=bool(train_p.get("use_soft_prior", False)),
             steps_prior=int(train_p.get("aniso_steps_prior", 35)),
         )
+        if want_graph_cache:
+            R_prev_flat, prior_flat, agpe_cache = r0_out
+        else:
+            R_prev_flat, prior_flat = r0_out
 
         # append R as extra channel
         R_np = R_prev_flat.detach().cpu().numpy()[:, np.newaxis, :].astype(np.float32)  # (N,1,H)
@@ -357,6 +381,51 @@ def train(train_p: dict):
     alpha_decay_epochs = int(train_p.get("alpha_prior_decay_epochs", max(1, train_p.get("epochs", 1000))))
     conf_thresh = float(train_p.get("conf_thresh", 0.75))
     lambda_phys_damp = float(train_p.get("lambda_phys_damp", 0.0))
+    agpe_cache_graph = bool(train_p.get("agpe_cache_graph", True))
+    agpe_refine_graph = bool(train_p.get("agpe_refine_graph", True))
+    agpe_rebuild_every = int(train_p.get("agpe_rebuild_every", 50))
+    agpe_topo_change_pch_l1 = float(train_p.get("agpe_topo_change_pch_l1", 0.05))
+    graph_log_path = join("results", f"{run_id}_{data_flag}_agpe_graph_log.csv")
+
+    def _append_graph_log(epoch_idx: int, r_now_flat: torch.Tensor) -> None:
+        if not want_graph_cache:
+            return
+        stats = getattr(agpe_cache, "last_stats", {}) if agpe_cache is not None else {}
+        r_now = r_now_flat.detach().cpu().numpy()
+        row = {
+            "epoch": int(epoch_idx),
+            "backend": str(train_p.get("aniso_backend", "grid")),
+            "n_nodes_mean": float(stats.get("n_nodes_mean", 0.0)),
+            "n_edges_mean": float(stats.get("n_edges_mean", 0.0)),
+            "long_edge_ratio": float(stats.get("long_edge_ratio", 0.0)),
+            "snap_ok_ratio": float(stats.get("snap_ok_ratio", 0.0)),
+            "fallback_slices": int(stats.get("fallback_slices", 0)),
+            "rebuild_slices": int(stats.get("rebuild_slices", 0)),
+            "cache_hits": int(stats.get("cache_hits", 0)),
+            "R_mean": float(r_now.mean()),
+            "R_ratio_gt_0p5": float((r_now > 0.5).mean()),
+        }
+        write_header = not os.path.isfile(graph_log_path)
+        with open(graph_log_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "epoch",
+                    "backend",
+                    "n_nodes_mean",
+                    "n_edges_mean",
+                    "long_edge_ratio",
+                    "snap_ok_ratio",
+                    "fallback_slices",
+                    "rebuild_slices",
+                    "cache_hits",
+                    "R_mean",
+                    "R_ratio_gt_0p5",
+                ],
+            )
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
 
     def _alpha_prior(epoch: int) -> float:
         t = min(1.0, max(0.0, epoch / float(alpha_decay_epochs)))
@@ -365,7 +434,7 @@ def train(train_p: dict):
     @torch.no_grad()
     def update_R(epoch: int) -> None:
         """Recompute p_channel/conf/residual from current models, then rebuild R and EMA-update."""
-        nonlocal seismic, R_prev_flat
+        nonlocal seismic, R_prev_flat, agpe_cache
 
         if not iterative_R:
             return
@@ -431,7 +500,7 @@ def train(train_p: dict):
         alpha = _alpha_prior(epoch)
         well_idx = torch.from_numpy(traces_train.astype(np.int64)).to(device=device)
 
-        R_new_flat, _ = build_R_and_prior_from_cube(
+        r_upd_out = build_R_and_prior_from_cube(
             seismic_3d=torch.from_numpy(meta["seismic3d"]).to(device=device, dtype=torch.float32),
             ai_3d=torch.from_numpy(meta["model3d"]).to(device=device, dtype=torch.float32),
             well_trace_indices=well_idx,
@@ -450,10 +519,31 @@ def train(train_p: dict):
             backend=str(train_p.get("aniso_backend", "grid")),
             aniso_use_tensor_strength=bool(train_p.get("aniso_use_tensor_strength", False)),
             aniso_tensor_strength_power=float(train_p.get("aniso_tensor_strength_power", 1.0)),
+            agpe_skel_p_thresh=float(train_p.get("agpe_skel_p_thresh", 0.60)),
+            agpe_skel_min_nodes=int(train_p.get("agpe_skel_min_nodes", 30)),
+            agpe_skel_snap_radius=int(train_p.get("agpe_skel_snap_radius", 5)),
+            agpe_long_edges=bool(train_p.get("agpe_long_edges", True)),
+            agpe_long_max_step=int(train_p.get("agpe_long_max_step", 6)),
+            agpe_long_step=int(train_p.get("agpe_long_step", 2)),
+            agpe_long_cos_thresh=float(train_p.get("agpe_long_cos_thresh", 0.70)),
+            agpe_long_weight=float(train_p.get("agpe_long_weight", 0.50)),
+            agpe_edge_tau_p=float(train_p.get("agpe_edge_tau_p", 0.25)),
+            agpe_lift_sigma=float(train_p.get("agpe_lift_sigma", 3.0)),
+            agpe_cache_graph=agpe_cache_graph,
+            agpe_refine_graph=agpe_refine_graph,
+            agpe_rebuild_every=agpe_rebuild_every,
+            agpe_topo_change_pch_l1=agpe_topo_change_pch_l1,
+            epoch=int(epoch),
+            graph_cache=agpe_cache,
+            return_graph_cache=bool(want_graph_cache),
             phys_residual_3d=pres_3d if lambda_phys_damp > 0 else None,
             lambda_phys=float(lambda_phys_damp),
             use_soft_prior=False,
         )
+        if want_graph_cache:
+            R_new_flat, _, agpe_cache = r_upd_out
+        else:
+            R_new_flat, _ = r_upd_out
 
         # EMA update for stability
         R_upd = (float(R_ema_beta) * R_prev_flat + (1.0 - float(R_ema_beta)) * R_new_flat).clamp(0.0, 1.0)
@@ -466,6 +556,7 @@ def train(train_p: dict):
         # log
         r_np = R_upd.detach().cpu().numpy()
         print(f"[R-UPDATE] alpha_prior={alpha:.3f} mean={r_np.mean():.4f} max={r_np.max():.4f} ratio(R>0.5)={(r_np>0.5).mean():.4f}")
+        _append_graph_log(epoch_idx=epoch, r_now_flat=R_upd)
 
         # optional save
         if int(train_p.get("save_R_every", 0)) > 0 and (epoch % int(train_p["save_R_every"])) == 0:

@@ -4,6 +4,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
+from openpyxl import Workbook
+
 from setting import TCN1D_test_p, TCN1D_train_p
 from train_multitask import train
 from test_3D import test
@@ -27,6 +29,43 @@ CASE_PRESETS: Dict[str, Dict[str, object]] = {
         "aniso_backend": "graph_lattice",
         "aniso_use_tensor_strength": True,
         "run_id_suffix": "_glat_ts",
+    },
+    # Skeleton graph without long-range edges
+    "skel_nolong": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": False,
+        "iterative_R": False,
+        "run_id_suffix": "_skel_nolong",
+    },
+    # Skeleton graph with long-range edges
+    "skel_long": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": True,
+        "iterative_R": False,
+        "run_id_suffix": "_skel_long",
+    },
+    # Skeleton graph iterative-R, no topology rebuild (edge-weight update only)
+    "skel_noref": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": True,
+        "iterative_R": True,
+        "agpe_cache_graph": True,
+        "agpe_refine_graph": False,
+        "run_id_suffix": "_skel_noref",
+    },
+    # Skeleton graph iterative-R, periodic/triggered topology rebuild enabled
+    "skel_ref": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": True,
+        "iterative_R": True,
+        "agpe_cache_graph": True,
+        "agpe_refine_graph": True,
+        "agpe_rebuild_every": 50,
+        "run_id_suffix": "_skel_ref",
     },
 }
 
@@ -75,6 +114,26 @@ def _move_file_safe(src: Path, dst_dir: Path) -> Path:
         idx += 1
 
 
+def _save_metrics_excel(xlsx_path: Path, rows: list[dict], sheet_name: str = "metrics") -> None:
+    """Save rows to a simple Excel table."""
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+
+    if not rows:
+        ws.append(["info"])
+        ws.append(["no metrics rows"])
+        wb.save(xlsx_path)
+        return
+
+    headers = list(rows[0].keys())
+    ws.append(headers)
+    for row in rows:
+        ws.append([row.get(h, "") for h in headers])
+    wb.save(xlsx_path)
+
+
 def build_case_configs(case_name: str, epochs_override: int | None) -> tuple[dict, dict]:
     if case_name not in CASE_PRESETS:
         raise ValueError(f"Unknown case: {case_name}")
@@ -104,6 +163,7 @@ def run_cases(cases: List[str], mode: str, epochs_override: int | None) -> None:
     run_root = results_root / f"ablation_{run_stamp}"
     run_root.mkdir(parents=True, exist_ok=True)
     print(f"[RUN] ablation results root: {run_root.as_posix()}")
+    summary_rows: list[dict] = []
 
     for idx, case in enumerate(cases, start=1):
         train_cfg, test_cfg = build_case_configs(case, epochs_override=epochs_override)
@@ -133,7 +193,23 @@ def run_cases(cases: List[str], mode: str, epochs_override: int | None) -> None:
 
         if mode in ("test", "both"):
             print("[RUN] test_3D.test(...)")
-            test(test_cfg)
+            metrics = test(test_cfg)
+            if isinstance(metrics, dict):
+                case_metrics = {
+                    "case_dir": case_dir.name,
+                    "case": case,
+                    "backend": str(backend),
+                    "use_tensor_strength": bool(use_ts),
+                    "agpe_long_edges": bool(train_cfg.get("agpe_long_edges", True)),
+                    "agpe_refine_graph": bool(train_cfg.get("agpe_refine_graph", True)),
+                    "agpe_cache_graph": bool(train_cfg.get("agpe_cache_graph", True)),
+                    "agpe_rebuild_every": int(train_cfg.get("agpe_rebuild_every", 50)),
+                    "iterative_R": bool(train_cfg.get("iterative_R", False)),
+                    **metrics,
+                }
+                _save_metrics_excel(case_dir / "test_metrics.xlsx", [case_metrics], sheet_name="test_metrics")
+                summary_rows.append(case_metrics)
+                print(f"[SAVE] case metrics -> {(case_dir / 'test_metrics.xlsx').as_posix()}")
 
         new_files = _list_case_result_files(results_root, prefixes)
         if new_files:
@@ -143,15 +219,22 @@ def run_cases(cases: List[str], mode: str, epochs_override: int | None) -> None:
         else:
             print(f"[SAVE][WARN] no case artifacts found for prefixes={prefixes}")
 
+    if summary_rows:
+        summary_xlsx = run_root / "ablation_metrics_summary.xlsx"
+        _save_metrics_excel(summary_xlsx, summary_rows, sheet_name="summary")
+        print(f"[SAVE] ablation summary metrics -> {summary_xlsx.as_posix()}")
+    else:
+        print("[SAVE][WARN] no test metrics collected; summary excel not generated.")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run AGPE ablations for grid / graph_lattice backends."
+        description="Run AGPE ablations for grid / graph_lattice / skeleton_graph backends."
     )
     parser.add_argument(
         "--cases",
         nargs="+",
-        default=["grid", "glat", "glat_ts"],
+        default=["grid", "glat", "glat_ts", "skel_nolong", "skel_long", "skel_noref", "skel_ref"],
         choices=sorted(CASE_PRESETS.keys()),
         help="Ablation cases to run (default: all).",
     )

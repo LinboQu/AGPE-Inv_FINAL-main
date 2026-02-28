@@ -7,12 +7,15 @@ __pycache__/
 # VSCode
 .vscode/
 
-# Data / outputs (按需保留 readme.txt)
-runs/
-results/*.npy
-save_train_model/*.pth
-save_train_model/*.pt
+# Experiment outputs
+data/
+results/
+save_train_model/
+
+# Model weights
 *.ckpt
+*.pth
+*.pt
 
 # OS
 .DS_Store
