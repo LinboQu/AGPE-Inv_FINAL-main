@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VSCode
+.vscode/
+
+# Data / outputs (按需保留 readme.txt)
+runs/
+results/*.npy
+save_train_model/*.pth
+save_train_model/*.pt
+*.ckpt
+
+# OS
+.DS_Store
+Thumbs.db
