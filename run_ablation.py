@@ -18,11 +18,25 @@ CASE_PRESETS: Dict[str, Dict[str, object]] = {
         "aniso_use_tensor_strength": False,
         "run_id_suffix": "_grid",
     },
+    # Grid backend with iterative_R explicitly disabled
+    "grid_static": {
+        "aniso_backend": "grid",
+        "aniso_use_tensor_strength": False,
+        "iterative_R": False,
+        "run_id_suffix": "_grid_static",
+    },
     # Graph backend without tensor-strength modulation (parity with grid)
     "glat": {
         "aniso_backend": "graph_lattice",
         "aniso_use_tensor_strength": False,
         "run_id_suffix": "_glat",
+    },
+    # Graph-lattice backend with iterative_R explicitly disabled
+    "glat_static": {
+        "aniso_backend": "graph_lattice",
+        "aniso_use_tensor_strength": False,
+        "iterative_R": False,
+        "run_id_suffix": "_glat_static",
     },
     # Graph backend with tensor-strength modulation enabled
     "glat_ts": {
@@ -37,6 +51,16 @@ CASE_PRESETS: Dict[str, Dict[str, object]] = {
         "agpe_long_edges": False,
         "iterative_R": False,
         "run_id_suffix": "_skel_nolong",
+    },
+    # Skeleton graph without long-range edges, iterative-R enabled
+    "skel_nolong_iter": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": False,
+        "iterative_R": True,
+        "agpe_cache_graph": True,
+        "agpe_refine_graph": False,
+        "run_id_suffix": "_skel_nolong_iter",
     },
     # Skeleton graph with long-range edges
     "skel_long": {
@@ -234,7 +258,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cases",
         nargs="+",
-        default=["grid", "glat", "glat_ts", "skel_nolong", "skel_long", "skel_noref", "skel_ref"],
+        default=[
+            "grid",
+            "grid_static",
+            "glat",
+            "glat_static",
+            "glat_ts",
+            "skel_nolong",
+            "skel_nolong_iter",
+            "skel_long",
+            "skel_noref",
+            "skel_ref",
+        ],
         choices=sorted(CASE_PRESETS.keys()),
         help="Ablation cases to run (default: all).",
     )

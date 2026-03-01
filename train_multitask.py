@@ -219,6 +219,85 @@ def train(train_p: dict):
     agpe_cache = None
     aniso_backend = str(train_p.get("aniso_backend", "grid"))
     want_graph_cache = aniso_backend == "skeleton_graph"
+    graph_log_path = join("results", f"{run_id}_{data_flag}_agpe_graph_log.csv")
+    r_update_every_cfg = int(train_p.get("R_update_every", 50))
+    use_tensor_strength_cfg = bool(train_p.get("aniso_use_tensor_strength", False))
+    lambda_phys_damp_cfg = float(train_p.get("lambda_phys_damp", 0.0))
+
+    def _append_aniso_health_log(
+        epoch_idx: int,
+        r_now_flat: torch.Tensor,
+        alpha_prior_value: float,
+        conf_thresh_value: float,
+        iterative_flag: bool,
+    ) -> None:
+        if r_now_flat is None:
+            return
+        if not bool(train_p.get("use_aniso_conditioning", False)):
+            return
+        if data_flag != "Stanford_VI":
+            return
+
+        stats = getattr(agpe_cache, "last_stats", {}) if (want_graph_cache and agpe_cache is not None) else {}
+        r_now = r_now_flat.detach().cpu().numpy().reshape(-1)
+        if r_now.size == 0:
+            return
+
+        row = {
+            "epoch": int(epoch_idx),
+            "backend": str(train_p.get("aniso_backend", "grid")),
+            "n_nodes_mean": float(stats.get("n_nodes_mean", 0.0)),
+            "n_edges_mean": float(stats.get("n_edges_mean", 0.0)),
+            "long_edge_ratio": float(stats.get("long_edge_ratio", 0.0)),
+            "snap_ok_ratio": float(stats.get("snap_ok_ratio", 0.0)),
+            "fallback_slices": int(stats.get("fallback_slices", 0)),
+            "rebuild_slices": int(stats.get("rebuild_slices", 0)),
+            "cache_hits": int(stats.get("cache_hits", 0)),
+            "R_mean": float(r_now.mean()),
+            "R_ratio_gt_0p5": float((r_now > 0.5).mean()),
+            "iterative_R": int(bool(iterative_flag)),
+            "R_update_every": int(r_update_every_cfg),
+            "use_tensor_strength": int(bool(use_tensor_strength_cfg)),
+            "alpha_prior": float(alpha_prior_value),
+            "conf_thresh": float(conf_thresh_value),
+            "lambda_phys_damp": float(lambda_phys_damp_cfg),
+            "R_std": float(r_now.std()),
+            "R_min": float(r_now.min()),
+            "R_max": float(r_now.max()),
+            "R_ratio_lt_0p1": float((r_now < 0.1).mean()),
+        }
+
+        write_header = not os.path.isfile(graph_log_path)
+        with open(graph_log_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "epoch",
+                    "backend",
+                    "n_nodes_mean",
+                    "n_edges_mean",
+                    "long_edge_ratio",
+                    "snap_ok_ratio",
+                    "fallback_slices",
+                    "rebuild_slices",
+                    "cache_hits",
+                    "R_mean",
+                    "R_ratio_gt_0p5",
+                    "iterative_R",
+                    "R_update_every",
+                    "use_tensor_strength",
+                    "alpha_prior",
+                    "conf_thresh",
+                    "lambda_phys_damp",
+                    "R_std",
+                    "R_min",
+                    "R_max",
+                    "R_ratio_lt_0p1",
+                ],
+            )
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
 
     if train_p.get("use_aniso_conditioning", False) and data_flag == "Stanford_VI":
         H, IL, XL = int(meta["H"]), int(meta["inline"]), int(meta["xline"])
@@ -294,6 +373,13 @@ def train(train_p: dict):
         # log stats
         r_np = R_prev_flat.detach().cpu().numpy()
         print(f"[R0] mean={r_np.mean():.4f} max={r_np.max():.4f} ratio(R>0.5)={(r_np>0.5).mean():.4f}")
+        _append_aniso_health_log(
+            epoch_idx=0,
+            r_now_flat=R_prev_flat,
+            alpha_prior_value=1.0,
+            conf_thresh_value=0.0,
+            iterative_flag=bool(train_p.get("iterative_R", False) and (R_prev_flat is not None)),
+        )
     else:
         # legacy: linearly sampled wells (no R channel)
         traces_train = np.linspace(0, len(model) - 1, no_wells, dtype=int)
@@ -385,47 +471,6 @@ def train(train_p: dict):
     agpe_refine_graph = bool(train_p.get("agpe_refine_graph", True))
     agpe_rebuild_every = int(train_p.get("agpe_rebuild_every", 50))
     agpe_topo_change_pch_l1 = float(train_p.get("agpe_topo_change_pch_l1", 0.05))
-    graph_log_path = join("results", f"{run_id}_{data_flag}_agpe_graph_log.csv")
-
-    def _append_graph_log(epoch_idx: int, r_now_flat: torch.Tensor) -> None:
-        if not want_graph_cache:
-            return
-        stats = getattr(agpe_cache, "last_stats", {}) if agpe_cache is not None else {}
-        r_now = r_now_flat.detach().cpu().numpy()
-        row = {
-            "epoch": int(epoch_idx),
-            "backend": str(train_p.get("aniso_backend", "grid")),
-            "n_nodes_mean": float(stats.get("n_nodes_mean", 0.0)),
-            "n_edges_mean": float(stats.get("n_edges_mean", 0.0)),
-            "long_edge_ratio": float(stats.get("long_edge_ratio", 0.0)),
-            "snap_ok_ratio": float(stats.get("snap_ok_ratio", 0.0)),
-            "fallback_slices": int(stats.get("fallback_slices", 0)),
-            "rebuild_slices": int(stats.get("rebuild_slices", 0)),
-            "cache_hits": int(stats.get("cache_hits", 0)),
-            "R_mean": float(r_now.mean()),
-            "R_ratio_gt_0p5": float((r_now > 0.5).mean()),
-        }
-        write_header = not os.path.isfile(graph_log_path)
-        with open(graph_log_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "epoch",
-                    "backend",
-                    "n_nodes_mean",
-                    "n_edges_mean",
-                    "long_edge_ratio",
-                    "snap_ok_ratio",
-                    "fallback_slices",
-                    "rebuild_slices",
-                    "cache_hits",
-                    "R_mean",
-                    "R_ratio_gt_0p5",
-                ],
-            )
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
 
     def _alpha_prior(epoch: int) -> float:
         t = min(1.0, max(0.0, epoch / float(alpha_decay_epochs)))
@@ -556,7 +601,13 @@ def train(train_p: dict):
         # log
         r_np = R_upd.detach().cpu().numpy()
         print(f"[R-UPDATE] alpha_prior={alpha:.3f} mean={r_np.mean():.4f} max={r_np.max():.4f} ratio(R>0.5)={(r_np>0.5).mean():.4f}")
-        _append_graph_log(epoch_idx=epoch, r_now_flat=R_upd)
+        _append_aniso_health_log(
+            epoch_idx=epoch,
+            r_now_flat=R_upd,
+            alpha_prior_value=float(alpha),
+            conf_thresh_value=float(conf_thresh),
+            iterative_flag=bool(iterative_R),
+        )
 
         # optional save
         if int(train_p.get("save_R_every", 0)) > 0 and (epoch % int(train_p["save_R_every"])) == 0:
