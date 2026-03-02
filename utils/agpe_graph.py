@@ -86,9 +86,11 @@ def graph_diffuse(
     w: torch.Tensor,
     steps: int,
     eta: float,
+    well_soft_alpha: float = 1.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Diffusion on directed weighted graph."""
+    alpha = float(well_soft_alpha)
     r = r0_flat.clone()
     for _ in range(int(steps)):
         acc = torch.zeros_like(r)
@@ -97,7 +99,10 @@ def graph_diffuse(
         den.index_add_(0, dst, w)
         r_prop = acc / (den + eps)
         r = (1.0 - float(eta)) * r + float(eta) * r_prop
+        # Keep seed floor during diffusion; apply soft blending only once at the end.
         r = torch.maximum(r, well_mask_flat)
+    if 0.0 < alpha < 1.0 - 1e-8:
+        r = ((1.0 - alpha) * r + alpha * well_mask_flat).clamp(0.0, 1.0)
     return r
 
 

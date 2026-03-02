@@ -20,6 +20,7 @@ Notes:
 import os
 import csv
 import errno
+import random
 from os.path import join
 
 import numpy as np
@@ -193,6 +194,31 @@ def train(train_p: dict):
     no_wells = int(train_p.get("no_wells", 20))
     seed = int(train_p.get("seed", 2026))
     selected_wells_csv = train_p.get("selected_wells_csv", None)
+    deterministic_mode = bool(train_p.get("deterministic_mode", True))
+    deterministic_warn_only = bool(train_p.get("deterministic_warn_only", True))
+
+    # Reproducibility baseline: fix all random sources and enable deterministic kernels.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic_mode:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=deterministic_warn_only)
+        except TypeError:
+            # Older torch versions do not support warn_only.
+            torch.use_deterministic_algorithms(True)
+        print(
+            f"[DET] enabled seed={seed} cudnn.deterministic=True cudnn.benchmark=False "
+            f"warn_only={deterministic_warn_only}"
+        )
+    else:
+        print(f"[DET] disabled seed={seed}")
 
     # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -209,7 +235,19 @@ def train(train_p: dict):
     np.save(join("save_train_model", f"norm_stats_{data_flag}.npy"), stats)  # legacy (may be overwritten)
     np.save(join("save_train_model", f"norm_stats_{run_id}_{data_flag}.npy"), stats)  # strong binding
     print(f"[NORM] saved stats: norm_stats_{run_id}_{data_flag}.npy (and legacy norm_stats_{data_flag}.npy)")
-    print(f"[AGPE] backend={train_p.get('aniso_backend', 'grid')} use_tensor_strength={bool(train_p.get('aniso_use_tensor_strength', False))}")
+    aniso_train_protocol = str(train_p.get("aniso_train_protocol", "closed_loop")).strip().lower()
+    if aniso_train_protocol not in ("closed_loop", "oracle"):
+        raise ValueError(
+            f"Unknown aniso_train_protocol='{aniso_train_protocol}', expected 'closed_loop' or 'oracle'."
+        )
+    closed_loop_alpha_prior = float(train_p.get("aniso_closed_loop_alpha_prior", 0.0))
+    closed_loop_conf_thresh = float(train_p.get("aniso_closed_loop_conf_thresh", train_p.get("conf_thresh", 0.60)))
+    agpe_neutral_p = float(train_p.get("agpe_neutral_p", 0.5))
+    print(
+        f"[AGPE] backend={train_p.get('aniso_backend', 'grid')} "
+        f"use_tensor_strength={bool(train_p.get('aniso_use_tensor_strength', False))} "
+        f"train_protocol={aniso_train_protocol}"
+    )
 
     # -----------------------------
     # Build / maintain anisotropic R(x)
@@ -305,16 +343,25 @@ def train(train_p: dict):
         print(f"[WELLS] using wells: {selected_wells_csv} | count={len(traces_train)}")
         np.save(join("results", f"{run_id}_{data_flag}_well_trace_indices.npy"), traces_train)
 
-        # build initial R from facies PRIOR (Stanford VI: Facies.npy is available; in real: interpreter prior)
         well_idx = torch.from_numpy(traces_train.astype(np.int64)).to(device)
         seis3d = torch.from_numpy(meta["seismic3d"]).to(device=device, dtype=torch.float32)
-        fac_prior3d = torch.from_numpy(meta["facies3d"]).to(device=device, dtype=torch.long)
         ai3d = torch.from_numpy(meta["model3d"]).to(device=device, dtype=torch.float32)
 
-        # ---- NEW: provide p_channel_3d + conf_3d for init (do NOT rely on facies_3d truth) ----
         ch_id = int(train_p.get("channel_id", 2))
-        p0_3d = (fac_prior3d == ch_id).float()          # [H,IL,XL] in {0,1}
-        conf0_3d = torch.ones_like(p0_3d)               # [H,IL,XL] all confident
+        if aniso_train_protocol == "oracle":
+            fac_prior3d = torch.from_numpy(meta["facies3d"]).to(device=device, dtype=torch.long)
+            p0_3d = (fac_prior3d == ch_id).float()
+            conf0_3d = torch.ones_like(p0_3d)
+            r0_alpha_prior = 1.0
+            r0_conf_thresh = 0.0
+            print("[AGPE][TRAIN][WARN] protocol=oracle (uses facies prior volume).")
+        else:
+            fac_prior3d = None
+            p0_3d = torch.full_like(ai3d, float(agpe_neutral_p))
+            conf0_3d = torch.ones_like(p0_3d)
+            r0_alpha_prior = float(closed_loop_alpha_prior)
+            r0_conf_thresh = float(closed_loop_conf_thresh)
+            print("[AGPE][TRAIN] protocol=closed_loop (R0 without facies oracle).")
         
         r0_out = build_R_and_prior_from_cube(
             seismic_3d=seis3d,
@@ -329,8 +376,9 @@ def train(train_p: dict):
             facies_prior_3d=fac_prior3d,
             
             channel_id=ch_id,
-            alpha_prior=1.0,      # initial: pure prior
-            conf_thresh=0.0,
+            alpha_prior=float(r0_alpha_prior),
+            conf_thresh=float(r0_conf_thresh),
+            neutral_p=float(agpe_neutral_p),
             steps_R=int(train_p.get("aniso_steps_R", 25)),
             eta=float(train_p.get("aniso_eta", 0.6)),
             gamma=float(train_p.get("aniso_gamma", 8.0)),
@@ -340,16 +388,21 @@ def train(train_p: dict):
             backend=str(train_p.get("aniso_backend", "grid")),
             aniso_use_tensor_strength=bool(train_p.get("aniso_use_tensor_strength", False)),
             aniso_tensor_strength_power=float(train_p.get("aniso_tensor_strength_power", 1.0)),
-            agpe_skel_p_thresh=float(train_p.get("agpe_skel_p_thresh", 0.60)),
+            agpe_skel_p_thresh=float(train_p.get("agpe_skel_p_thresh", 0.55)),
             agpe_skel_min_nodes=int(train_p.get("agpe_skel_min_nodes", 30)),
             agpe_skel_snap_radius=int(train_p.get("agpe_skel_snap_radius", 5)),
             agpe_long_edges=bool(train_p.get("agpe_long_edges", True)),
             agpe_long_max_step=int(train_p.get("agpe_long_max_step", 6)),
             agpe_long_step=int(train_p.get("agpe_long_step", 2)),
             agpe_long_cos_thresh=float(train_p.get("agpe_long_cos_thresh", 0.70)),
-            agpe_long_weight=float(train_p.get("agpe_long_weight", 0.50)),
+            agpe_long_weight=float(train_p.get("agpe_long_weight", 0.35)),
             agpe_edge_tau_p=float(train_p.get("agpe_edge_tau_p", 0.25)),
-            agpe_lift_sigma=float(train_p.get("agpe_lift_sigma", 3.0)),
+            agpe_lift_sigma=float(train_p.get("agpe_lift_sigma", 2.2)),
+            agpe_well_seed_mode=str(train_p.get("agpe_well_seed_mode", "depth_gate")),
+            agpe_well_seed_power=float(train_p.get("agpe_well_seed_power", 1.0)),
+            agpe_well_seed_min=float(train_p.get("agpe_well_seed_min", 0.02)),
+            agpe_well_seed_use_conf=bool(train_p.get("agpe_well_seed_use_conf", True)),
+            agpe_well_soft_alpha=float(train_p.get("agpe_well_soft_alpha", 0.20)),
             agpe_cache_graph=bool(train_p.get("agpe_cache_graph", True)),
             agpe_refine_graph=bool(train_p.get("agpe_refine_graph", True)),
             agpe_rebuild_every=int(train_p.get("agpe_rebuild_every", 50)),
@@ -376,8 +429,8 @@ def train(train_p: dict):
         _append_aniso_health_log(
             epoch_idx=0,
             r_now_flat=R_prev_flat,
-            alpha_prior_value=1.0,
-            conf_thresh_value=0.0,
+            alpha_prior_value=float(r0_alpha_prior),
+            conf_thresh_value=float(r0_conf_thresh),
             iterative_flag=bool(train_p.get("iterative_R", False) and (R_prev_flat is not None)),
         )
     else:
@@ -387,9 +440,14 @@ def train(train_p: dict):
     # datasets / loaders
     train_dataset = SeismicDataset1D_SPF(seismic, model, facies, traces_train)
 
-    num_workers = int(train_p.get("num_workers", 0))
+    configured_workers = int(train_p.get("num_workers", 0))
+    if deterministic_mode and configured_workers != 0:
+        print(f"[DET] override num_workers {configured_workers} -> 0 for deterministic baseline.")
+    num_workers = 0 if deterministic_mode else configured_workers
     pin_memory = bool(train_p.get("pin_memory", torch.cuda.is_available()))
     persistent_workers = bool(train_p.get("persistent_workers", True)) and (num_workers > 0)
+    train_loader_generator = torch.Generator()
+    train_loader_generator.manual_seed(seed + 11)
 
     train_loader = DataLoader(
         train_dataset,
@@ -399,6 +457,7 @@ def train(train_p: dict):
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         drop_last=False,
+        generator=train_loader_generator,
     )
 
     # Weak supervision loader (scheme A scheduling)
@@ -417,6 +476,7 @@ def train(train_p: dict):
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         drop_last=False,
+        generator=torch.Generator().manual_seed(seed + 29),
     )
 
     # validation (small subset)
@@ -445,6 +505,13 @@ def train(train_p: dict):
     lam_ai = float(train_p.get("lambda_ai", 5.0))
     lam_fac = float(train_p.get("lambda_facies", 0.2))
     lam_rec = float(train_p.get("lambda_recon", 1.0))
+    use_two_stage_loss = bool(train_p.get("use_two_stage_loss", True))
+    stageA_epochs = int(train_p.get("stageA_epochs", 200))
+    stageB_ramp_epochs = int(train_p.get("stageB_ramp_epochs", 200))
+    stageA_lambda_ai_mult = float(train_p.get("stageA_lambda_ai_mult", 1.8))
+    stageA_lambda_facies_mult = float(train_p.get("stageA_lambda_facies_mult", 0.30))
+    stageA_lambda_recon_mult = float(train_p.get("stageA_lambda_recon_mult", 0.30))
+    lambda_amp_anchor = float(train_p.get("lambda_amp_anchor", 0.05))
     facies_detach_y = bool(train_p.get("facies_detach_y", True))
     grad_clip = float(train_p.get("grad_clip", 0.0))
 
@@ -457,6 +524,7 @@ def train(train_p: dict):
     # weak supervision scheduling
     ws_every = int(train_p.get("ws_every", 5))
     ws_max_batches = int(train_p.get("ws_max_batches", 50))
+    ws_max_batches_stageA = int(train_p.get("ws_max_batches_stageA", max(10, ws_max_batches // 3)))
 
     # iterative R scheduling (recommended)
     iterative_R = bool(train_p.get("iterative_R", False)) and (R_prev_flat is not None)
@@ -475,6 +543,27 @@ def train(train_p: dict):
     def _alpha_prior(epoch: int) -> float:
         t = min(1.0, max(0.0, epoch / float(alpha_decay_epochs)))
         return alpha_start * (1 - t) + alpha_end * t
+
+    def _loss_weights(epoch: int) -> tuple[float, float, float]:
+        """Two-stage schedule to avoid early weak-supervision drift."""
+        if (not use_two_stage_loss) or stageA_epochs <= 0:
+            return lam_ai, lam_fac, lam_rec
+
+        lam_ai_A = lam_ai * stageA_lambda_ai_mult
+        lam_fac_A = lam_fac * stageA_lambda_facies_mult
+        lam_rec_A = lam_rec * stageA_lambda_recon_mult
+
+        if epoch < stageA_epochs:
+            return lam_ai_A, lam_fac_A, lam_rec_A
+
+        if stageB_ramp_epochs <= 0:
+            return lam_ai, lam_fac, lam_rec
+
+        t = min(1.0, max(0.0, (epoch - stageA_epochs) / float(stageB_ramp_epochs)))
+        ai_t = lam_ai_A * (1.0 - t) + lam_ai * t
+        fac_t = lam_fac_A * (1.0 - t) + lam_fac * t
+        rec_t = lam_rec_A * (1.0 - t) + lam_rec * t
+        return ai_t, fac_t, rec_t
 
     @torch.no_grad()
     def update_R(epoch: int) -> None:
@@ -538,11 +627,16 @@ def train(train_p: dict):
         conf_3d = torch.from_numpy(conf.T.reshape(H, IL, XL)).to(device=device, dtype=torch.float32)
         pres_3d = torch.from_numpy(pres.T.reshape(H, IL, XL)).to(device=device, dtype=torch.float32)
 
-        # prior facies (anchor). For Stanford VI-E we use Facies.npy; for real data use interpreter prior.
-        fac_prior3d = torch.from_numpy(meta["facies3d"]).to(device=device, dtype=torch.long)
+        if aniso_train_protocol == "oracle":
+            fac_prior3d = torch.from_numpy(meta["facies3d"]).to(device=device, dtype=torch.long)
+            alpha = _alpha_prior(epoch)
+            conf_use = float(conf_thresh)
+        else:
+            fac_prior3d = None
+            alpha = float(closed_loop_alpha_prior)
+            conf_use = float(closed_loop_conf_thresh)
 
-        # rebuild R_new from p_channel/conf, with prior mixing + confidence gating + physics damping
-        alpha = _alpha_prior(epoch)
+        # rebuild R_new from p_channel/conf under selected protocol
         well_idx = torch.from_numpy(traces_train.astype(np.int64)).to(device=device)
 
         r_upd_out = build_R_and_prior_from_cube(
@@ -554,7 +648,8 @@ def train(train_p: dict):
             facies_prior_3d=fac_prior3d,
             channel_id=int(train_p.get("channel_id", 2)),
             alpha_prior=float(alpha),
-            conf_thresh=float(conf_thresh),
+            conf_thresh=float(conf_use),
+            neutral_p=float(agpe_neutral_p),
             steps_R=int(train_p.get("aniso_steps_R", 25)),
             eta=float(train_p.get("aniso_eta", 0.6)),
             gamma=float(train_p.get("aniso_gamma", 8.0)),
@@ -564,16 +659,21 @@ def train(train_p: dict):
             backend=str(train_p.get("aniso_backend", "grid")),
             aniso_use_tensor_strength=bool(train_p.get("aniso_use_tensor_strength", False)),
             aniso_tensor_strength_power=float(train_p.get("aniso_tensor_strength_power", 1.0)),
-            agpe_skel_p_thresh=float(train_p.get("agpe_skel_p_thresh", 0.60)),
+            agpe_skel_p_thresh=float(train_p.get("agpe_skel_p_thresh", 0.55)),
             agpe_skel_min_nodes=int(train_p.get("agpe_skel_min_nodes", 30)),
             agpe_skel_snap_radius=int(train_p.get("agpe_skel_snap_radius", 5)),
             agpe_long_edges=bool(train_p.get("agpe_long_edges", True)),
             agpe_long_max_step=int(train_p.get("agpe_long_max_step", 6)),
             agpe_long_step=int(train_p.get("agpe_long_step", 2)),
             agpe_long_cos_thresh=float(train_p.get("agpe_long_cos_thresh", 0.70)),
-            agpe_long_weight=float(train_p.get("agpe_long_weight", 0.50)),
+            agpe_long_weight=float(train_p.get("agpe_long_weight", 0.35)),
             agpe_edge_tau_p=float(train_p.get("agpe_edge_tau_p", 0.25)),
-            agpe_lift_sigma=float(train_p.get("agpe_lift_sigma", 3.0)),
+            agpe_lift_sigma=float(train_p.get("agpe_lift_sigma", 2.2)),
+            agpe_well_seed_mode=str(train_p.get("agpe_well_seed_mode", "depth_gate")),
+            agpe_well_seed_power=float(train_p.get("agpe_well_seed_power", 1.0)),
+            agpe_well_seed_min=float(train_p.get("agpe_well_seed_min", 0.02)),
+            agpe_well_seed_use_conf=bool(train_p.get("agpe_well_seed_use_conf", True)),
+            agpe_well_soft_alpha=float(train_p.get("agpe_well_soft_alpha", 0.20)),
             agpe_cache_graph=agpe_cache_graph,
             agpe_refine_graph=agpe_refine_graph,
             agpe_rebuild_every=agpe_rebuild_every,
@@ -605,7 +705,7 @@ def train(train_p: dict):
             epoch_idx=epoch,
             r_now_flat=R_upd,
             alpha_prior_value=float(alpha),
-            conf_thresh_value=float(conf_thresh),
+            conf_thresh_value=float(conf_use),
             iterative_flag=bool(iterative_R),
         )
 
@@ -624,6 +724,14 @@ def train(train_p: dict):
 
     for epoch in range(int(train_p.get("epochs", 1000))):
         update_R(epoch)
+        lam_ai_t, lam_fac_t, lam_rec_t = _loss_weights(epoch)
+        ws_cap_t = ws_max_batches_stageA if (use_two_stage_loss and epoch < max(0, stageA_epochs)) else ws_max_batches
+        if epoch == 0 or epoch == stageA_epochs or epoch == (stageA_epochs + stageB_ramp_epochs):
+            print(
+                f"[LOSS-SCHED] epoch={epoch} "
+                f"lam_ai={lam_ai_t:.3f} lam_fac={lam_fac_t:.3f} lam_rec={lam_rec_t:.3f} "
+                f"ws_max_batches={ws_cap_t} lambda_amp_anchor={lambda_amp_anchor:.4f}"
+            )
 
         inverse_model.train()
         forward_model.train()
@@ -634,7 +742,7 @@ def train(train_p: dict):
             ws_running = 0.0
             ws_batches = 0
             for bi, batch in enumerate(Wsupervised_loader):
-                if ws_max_batches > 0 and bi >= ws_max_batches:
+                if ws_cap_t > 0 and bi >= ws_cap_t:
                     break
                 optimizer.zero_grad()
 
@@ -654,7 +762,7 @@ def train(train_p: dict):
                 fac_in = y_pred.detach() if facies_detach_y else y_pred
                 fac_logits = Facies_model(fac_in)
 
-                loss_ws = (lam_fac * criterion_facies(fac_logits, z)) + (lam_rec * criterion_rec(x_rec, x[:, 0:1, :]))
+                loss_ws = (lam_fac_t * criterion_facies(fac_logits, z)) + (lam_rec_t * criterion_rec(x_rec, x[:, 0:1, :]))
 
                 if prior_b is not None and bool(train_p.get("use_soft_prior", False)):
                     # weight by current R channel if present
@@ -693,8 +801,16 @@ def train(train_p: dict):
             l_ai = criterion_ai(y_pred, y)
             l_fac = criterion_facies(fac_logits, z)
             l_rec = criterion_rec(x_rec, x[:, 0:1, :])
+            # Amplitude anchor: penalize global mean/std drift to reduce polarity/scale branch flips.
+            amp_anchor = torch.tensor(0.0, device=device)
+            if lambda_amp_anchor > 0:
+                pred_mean = y_pred.mean(dim=(1, 2))
+                true_mean = y.mean(dim=(1, 2))
+                pred_std = y_pred.std(dim=(1, 2), unbiased=False)
+                true_std = y.std(dim=(1, 2), unbiased=False)
+                amp_anchor = ((pred_mean - true_mean) ** 2 + (pred_std - true_std) ** 2).mean()
 
-            loss = (lam_ai * l_ai) + (lam_fac * l_fac) + (lam_rec * l_rec)
+            loss = (lam_ai_t * l_ai) + (lam_fac_t * l_fac) + (lam_rec_t * l_rec) + (lambda_amp_anchor * amp_anchor)
             loss.backward()
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(

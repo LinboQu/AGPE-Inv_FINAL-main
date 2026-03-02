@@ -30,6 +30,7 @@ from os.path import join
 from torch.utils.data import DataLoader
 
 from setting import *
+from model.geomorphology_classification import Facies_model_class
 from utils.utils import standardize
 from utils.datasets import SeismicDataset1D
 
@@ -102,6 +103,65 @@ def load_stats_strict(run_id: str, data_flag: str) -> dict:
     raise FileNotFoundError(
         f"Cannot find stats for run_id={run_id}, data_flag={data_flag}\n"
         f"Tried:\n  {full_ckpt_path}\n  {p2}\n  {p3}"
+    )
+
+
+def _load_full_ckpt_strict(run_id: str, data_flag: str, device: torch.device) -> dict:
+    """Load full checkpoint with all multitask heads for closed-loop test."""
+    full_ckpt_path = join("save_train_model", f"{run_id}_full_ckpt_{data_flag}.pth")
+    if not os.path.isfile(full_ckpt_path):
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), full_ckpt_path)
+    ckpt = torch.load(full_ckpt_path, map_location=device)
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(f"[CKPT][ERROR] full_ckpt is not a dict: {full_ckpt_path}")
+    if "facies_state_dict" not in ckpt:
+        raise RuntimeError(f"[CKPT][ERROR] facies_state_dict missing in full_ckpt: {full_ckpt_path}")
+    return ckpt
+
+
+@torch.no_grad()
+def _infer_inverse_all(
+    inverse_model: torch.nn.Module,
+    seismic_np: np.ndarray,  # [N,C,H]
+    device: torch.device,
+    batch_size: int = 32,
+) -> np.ndarray:
+    """Run inverse model on all traces and return [N,H]."""
+    x = torch.from_numpy(seismic_np.astype(np.float32))
+    out_list: list[np.ndarray] = []
+    inverse_model.eval()
+    for i in range(0, x.shape[0], int(batch_size)):
+        xb = x[i:i + int(batch_size)].to(device)
+        yb = inverse_model(xb)
+        yb = yb.squeeze(1) if yb.ndim == 3 else yb
+        out_list.append(yb.detach().cpu().numpy())
+    return np.concatenate(out_list, axis=0).astype(np.float32)
+
+
+@torch.no_grad()
+def _infer_facies_channel_prob_all(
+    facies_model: torch.nn.Module,
+    ai_np: np.ndarray,  # [N,H]
+    channel_id: int,
+    device: torch.device,
+    batch_size: int = 64,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Predict channel probability/confidence from AI traces, return [N,H] each."""
+    x = torch.from_numpy(ai_np[:, np.newaxis, :].astype(np.float32))
+    p_list: list[np.ndarray] = []
+    c_list: list[np.ndarray] = []
+    facies_model.eval()
+    for i in range(0, x.shape[0], int(batch_size)):
+        xb = x[i:i + int(batch_size)].to(device)
+        logits = facies_model(xb)  # [B,K,H]
+        probs = torch.softmax(logits, dim=1)
+        pch = probs[:, int(channel_id), :]
+        conf = probs.max(dim=1).values
+        p_list.append(pch.detach().cpu().numpy())
+        c_list.append(conf.detach().cpu().numpy())
+    return (
+        np.concatenate(p_list, axis=0).astype(np.float32),
+        np.concatenate(c_list, axis=0).astype(np.float32),
     )
 
 # -----------------------------
@@ -481,15 +541,22 @@ def test(test_p: dict) -> dict:
     model = model[:, np.newaxis, :].astype(np.float32)
     facies = facies[:, np.newaxis, :]
 
-    ### 7. Build anisotropic R channel (if enabled)
+    ### 7. Load inverse model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt_path = f"save_train_model/{model_name}_{data_flag}.pth"
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), ckpt_path)
+    print(f"[TEST] loading model: {ckpt_path}")
+    inver_model = torch.load(ckpt_path, map_location=device).to(device)
+    inver_model.eval()
+
+    ### 8. Build anisotropic R channel (if enabled)
     R_flat = None
     if cfg.get("use_aniso_conditioning", False) and data_flag == "Stanford_VI":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
         # Use selected real well locations from CSV as AGPE seeds.
         seed = int(cfg.get("seed", 2026))
         csv_path = cfg.get("selected_wells_csv", None)
-        
+
         traces_well = load_selected_wells_trace_indices(
             csv_path=csv_path,
             IL=int(meta["inline"]),
@@ -501,62 +568,134 @@ def test(test_p: dict) -> dict:
         np.save(f"results/{model_name}_{data_flag}_well_trace_indices.npy", traces_well)
 
         well_idx = torch.from_numpy(traces_well).to(device)
-        # Move 3D cubes to device.
         seis3d = torch.from_numpy(meta["seismic3d"]).to(device=device, dtype=torch.float32)
-        fac3d = torch.from_numpy(meta["facies3d"]).to(device=device, dtype=torch.long)
         ai3d = torch.from_numpy(meta["model3d"]).to(device=device, dtype=torch.float32)
+        protocol = str(cfg.get("aniso_test_protocol", "closed_loop")).strip().lower()
 
-        # Build R(x).
-        R_flat, _ = build_R_and_prior_from_cube(
-            seismic_3d=seis3d,
-            facies_3d=fac3d,
-            ai_3d=ai3d,
-            well_trace_indices=well_idx,
-            channel_id=int(cfg.get("channel_id", 2)),
-            steps_R=int(cfg.get("aniso_steps_R", 25)),
-            eta=float(cfg.get("aniso_eta", 0.6)),
-            gamma=float(cfg.get("aniso_gamma", 8.0)),
-            tau=float(cfg.get("aniso_tau", 0.6)),
-            kappa=float(cfg.get("aniso_kappa", 4.0)),
-            sigma_st=float(cfg.get("aniso_sigma_st", 1.2)),
-            backend=str(cfg.get("aniso_backend", "grid")),
-            aniso_use_tensor_strength=bool(cfg.get("aniso_use_tensor_strength", False)),
-            aniso_tensor_strength_power=float(cfg.get("aniso_tensor_strength_power", 1.0)),
-            agpe_skel_p_thresh=float(cfg.get("agpe_skel_p_thresh", 0.60)),
-            agpe_skel_min_nodes=int(cfg.get("agpe_skel_min_nodes", 30)),
-            agpe_skel_snap_radius=int(cfg.get("agpe_skel_snap_radius", 5)),
-            agpe_long_edges=bool(cfg.get("agpe_long_edges", True)),
-            agpe_long_max_step=int(cfg.get("agpe_long_max_step", 6)),
-            agpe_long_step=int(cfg.get("agpe_long_step", 2)),
-            agpe_long_cos_thresh=float(cfg.get("agpe_long_cos_thresh", 0.70)),
-            agpe_long_weight=float(cfg.get("agpe_long_weight", 0.50)),
-            agpe_edge_tau_p=float(cfg.get("agpe_edge_tau_p", 0.25)),
-            agpe_lift_sigma=float(cfg.get("agpe_lift_sigma", 3.0)),
-            use_soft_prior=False,
-        )
+        if protocol == "closed_loop":
+            print("[AGPE][TEST] protocol=closed_loop (no facies oracle)")
+            full_ckpt = _load_full_ckpt_strict(run_id=run_id, data_flag=data_flag, device=device)
+            facies_model = Facies_model_class(facies_n=int(cfg.get("facies_n", 4))).to(device)
+            facies_model.load_state_dict(full_ckpt["facies_state_dict"], strict=True)
+            facies_model.eval()
+
+            # Bootstrap AI with zero-R second channel, then predict facies probs.
+            seismic_boot = seismic.copy()
+            if seismic_boot.shape[1] == 1:
+                z = np.zeros_like(seismic_boot[:, :1, :], dtype=np.float32)
+                seismic_boot = np.concatenate([seismic_boot, z], axis=1)
+            else:
+                seismic_boot[:, 1:2, :] = 0.0
+
+            ai_boot = _infer_inverse_all(
+                inverse_model=inver_model,
+                seismic_np=seismic_boot,
+                device=device,
+                batch_size=int(cfg.get("test_init_bs", 32)),
+            )
+            np.save(f"results/{model_name}_{data_flag}_pred_AI_bootstrap.npy", ai_boot)
+
+            pch_np, conf_np = _infer_facies_channel_prob_all(
+                facies_model=facies_model,
+                ai_np=ai_boot,
+                channel_id=int(cfg.get("channel_id", 2)),
+                device=device,
+                batch_size=int(cfg.get("test_facies_bs", 64)),
+            )
+            Hc, ILc, XLc = int(meta["H"]), int(meta["inline"]), int(meta["xline"])
+            pch_3d = torch.from_numpy(pch_np.T.reshape(Hc, ILc, XLc)).to(device=device, dtype=torch.float32)
+            conf_3d = torch.from_numpy(conf_np.T.reshape(Hc, ILc, XLc)).to(device=device, dtype=torch.float32)
+
+            R_flat, _ = build_R_and_prior_from_cube(
+                seismic_3d=seis3d,
+                ai_3d=ai3d,
+                well_trace_indices=well_idx,
+                p_channel_3d=pch_3d,
+                conf_3d=conf_3d,
+                facies_prior_3d=None,
+                channel_id=int(cfg.get("channel_id", 2)),
+                alpha_prior=float(cfg.get("aniso_closed_loop_alpha_prior", 0.0)),
+                conf_thresh=float(cfg.get("aniso_closed_loop_conf_thresh", cfg.get("conf_thresh", 0.60))),
+                steps_R=int(cfg.get("aniso_steps_R", 25)),
+                eta=float(cfg.get("aniso_eta", 0.6)),
+                gamma=float(cfg.get("aniso_gamma", 8.0)),
+                tau=float(cfg.get("aniso_tau", 0.6)),
+                kappa=float(cfg.get("aniso_kappa", 4.0)),
+                sigma_st=float(cfg.get("aniso_sigma_st", 1.2)),
+                backend=str(cfg.get("aniso_backend", "grid")),
+                aniso_use_tensor_strength=bool(cfg.get("aniso_use_tensor_strength", False)),
+                aniso_tensor_strength_power=float(cfg.get("aniso_tensor_strength_power", 1.0)),
+                agpe_skel_p_thresh=float(cfg.get("agpe_skel_p_thresh", 0.55)),
+                agpe_skel_min_nodes=int(cfg.get("agpe_skel_min_nodes", 30)),
+                agpe_skel_snap_radius=int(cfg.get("agpe_skel_snap_radius", 5)),
+                agpe_long_edges=bool(cfg.get("agpe_long_edges", True)),
+                agpe_long_max_step=int(cfg.get("agpe_long_max_step", 6)),
+                agpe_long_step=int(cfg.get("agpe_long_step", 2)),
+                agpe_long_cos_thresh=float(cfg.get("agpe_long_cos_thresh", 0.70)),
+                agpe_long_weight=float(cfg.get("agpe_long_weight", 0.35)),
+                agpe_edge_tau_p=float(cfg.get("agpe_edge_tau_p", 0.25)),
+                agpe_lift_sigma=float(cfg.get("agpe_lift_sigma", 2.2)),
+                agpe_well_seed_mode=str(cfg.get("agpe_well_seed_mode", "depth_gate")),
+                agpe_well_seed_power=float(cfg.get("agpe_well_seed_power", 1.0)),
+                agpe_well_seed_min=float(cfg.get("agpe_well_seed_min", 0.02)),
+                agpe_well_seed_use_conf=bool(cfg.get("agpe_well_seed_use_conf", True)),
+                agpe_well_soft_alpha=float(cfg.get("agpe_well_soft_alpha", 0.20)),
+                use_soft_prior=False,
+            )
+        elif protocol == "oracle":
+            print("[AGPE][TEST][WARN] protocol=oracle (uses facies_3d labels).")
+            fac3d = torch.from_numpy(meta["facies3d"]).to(device=device, dtype=torch.long)
+            R_flat, _ = build_R_and_prior_from_cube(
+                seismic_3d=seis3d,
+                facies_3d=fac3d,
+                ai_3d=ai3d,
+                well_trace_indices=well_idx,
+                channel_id=int(cfg.get("channel_id", 2)),
+                steps_R=int(cfg.get("aniso_steps_R", 25)),
+                eta=float(cfg.get("aniso_eta", 0.6)),
+                gamma=float(cfg.get("aniso_gamma", 8.0)),
+                tau=float(cfg.get("aniso_tau", 0.6)),
+                kappa=float(cfg.get("aniso_kappa", 4.0)),
+                sigma_st=float(cfg.get("aniso_sigma_st", 1.2)),
+                backend=str(cfg.get("aniso_backend", "grid")),
+                aniso_use_tensor_strength=bool(cfg.get("aniso_use_tensor_strength", False)),
+                aniso_tensor_strength_power=float(cfg.get("aniso_tensor_strength_power", 1.0)),
+                agpe_skel_p_thresh=float(cfg.get("agpe_skel_p_thresh", 0.55)),
+                agpe_skel_min_nodes=int(cfg.get("agpe_skel_min_nodes", 30)),
+                agpe_skel_snap_radius=int(cfg.get("agpe_skel_snap_radius", 5)),
+                agpe_long_edges=bool(cfg.get("agpe_long_edges", True)),
+                agpe_long_max_step=int(cfg.get("agpe_long_max_step", 6)),
+                agpe_long_step=int(cfg.get("agpe_long_step", 2)),
+                agpe_long_cos_thresh=float(cfg.get("agpe_long_cos_thresh", 0.70)),
+                agpe_long_weight=float(cfg.get("agpe_long_weight", 0.35)),
+                agpe_edge_tau_p=float(cfg.get("agpe_edge_tau_p", 0.25)),
+                agpe_lift_sigma=float(cfg.get("agpe_lift_sigma", 2.2)),
+                agpe_well_seed_mode=str(cfg.get("agpe_well_seed_mode", "depth_gate")),
+                agpe_well_seed_power=float(cfg.get("agpe_well_seed_power", 1.0)),
+                agpe_well_seed_min=float(cfg.get("agpe_well_seed_min", 0.02)),
+                agpe_well_seed_use_conf=bool(cfg.get("agpe_well_seed_use_conf", True)),
+                agpe_well_soft_alpha=float(cfg.get("agpe_well_soft_alpha", 0.20)),
+                use_soft_prior=False,
+            )
+        else:
+            raise ValueError(f"Unknown aniso_test_protocol='{protocol}', expected 'closed_loop' or 'oracle'.")
 
         # Append anisotropic reliability channel R(x) to seismic input.
         R_np = R_flat.detach().cpu().numpy()[:, np.newaxis, :].astype(np.float32)
-        seismic = np.concatenate([seismic, R_np], axis=1)  # (N,2,H)
+        if seismic.shape[1] == 1:
+            seismic = np.concatenate([seismic, R_np], axis=1)
+        else:
+            seismic[:, 1:2, :] = R_np
 
-        # Save R(x) visualization.
         out_prefix = f"{model_name}_{data_flag}"
         save_R_visualization(R_flat, meta, out_prefix, depth_slices=(40, 100, 160))
 
     print(f"[TEST] final input shapes: seismic={seismic.shape}, model={model.shape}")
 
-    ### 8. Build DataLoader
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ### 9. Build DataLoader
     traces_test = np.arange(len(model), dtype=int)
     test_dataset = SeismicDataset1D(seismic, model, traces_test)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-
-    ### 9. Load model
-    ckpt_path = f"save_train_model/{model_name}_{data_flag}.pth"
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), ckpt_path)
-    print(f"[TEST] loading model: {ckpt_path}")
-    inver_model = torch.load(ckpt_path, map_location=device).to(device)
 
     ### 10. Full-volume inference
     print("[TEST] inferencing...")

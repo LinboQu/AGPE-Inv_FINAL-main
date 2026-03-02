@@ -115,6 +115,16 @@ def _neighbor_shift_8(x: torch.Tensor) -> list[torch.Tensor]:
     return [E, W, S, N, SE, SW, NE, NW]
 
 
+def _apply_well_constraint(r: torch.Tensor, well_mask: torch.Tensor, well_soft_alpha: float) -> torch.Tensor:
+    """Apply hard/soft well constraint to reliability field."""
+    alpha = float(well_soft_alpha)
+    if alpha >= 1.0 - 1e-8:
+        return torch.maximum(r, well_mask)
+    if alpha <= 0.0:
+        return r
+    return ((1.0 - alpha) * r + alpha * well_mask).clamp(0.0, 1.0)
+
+
 @torch.no_grad()
 def anisotropic_reliability_2d(
     well_mask: torch.Tensor,  # [B,1,H,W]
@@ -126,6 +136,7 @@ def anisotropic_reliability_2d(
     tau: float = 0.6,
     kappa: float = 4.0,
     sigma_st: float = 1.2,
+    well_soft_alpha: float = 1.0,
     damp: torch.Tensor | None = None,  # [B,1,H,W] optional, 0..1, smaller -> harder to propagate
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -180,7 +191,11 @@ def anisotropic_reliability_2d(
             R_prop = R_prop + (w / w_sum) * rnb
 
         R = (1 - eta) * R + eta * R_prop
+        # Keep seed floor during diffusion; apply soft blending only once after iterations.
         R = torch.maximum(R, well_mask)
+
+    if 0.0 < float(well_soft_alpha) < 1.0 - 1e-8:
+        R = _apply_well_constraint(R, well_mask, well_soft_alpha)
 
     return R, v
 
@@ -196,6 +211,7 @@ def graph_lattice_reliability_2d(
     tau: float = 0.6,
     kappa: float = 4.0,
     sigma_st: float = 1.2,
+    well_soft_alpha: float = 1.0,
     damp: torch.Tensor | None = None,  # [B,1,H,W]
     use_tensor_strength: bool = True,
     tensor_strength_power: float = 1.0,
@@ -234,7 +250,17 @@ def graph_lattice_reliability_2d(
             strength_power=tensor_strength_power,
             eps=eps,
         )
-        r = graph_diffuse(r0, wm, src, dst, w, steps=steps, eta=eta, eps=eps)
+        r = graph_diffuse(
+            r0,
+            wm,
+            src,
+            dst,
+            w,
+            steps=steps,
+            eta=eta,
+            well_soft_alpha=well_soft_alpha,
+            eps=eps,
+        )
         r_out[b, 0] = r.reshape(il, xl)
 
     return r_out, v
@@ -252,19 +278,20 @@ def skeleton_graph_reliability_2d(
     tau: float = 0.6,
     kappa: float = 4.0,
     sigma_st: float = 1.2,
+    well_soft_alpha: float = 1.0,
     damp: torch.Tensor | None = None,  # [B,1,H,W]
     use_tensor_strength: bool = True,
     tensor_strength_power: float = 1.0,
-    agpe_skel_p_thresh: float = 0.60,
+    agpe_skel_p_thresh: float = 0.55,
     agpe_skel_min_nodes: int = 30,
     agpe_skel_snap_radius: int = 5,
     agpe_long_edges: bool = True,
     agpe_long_max_step: int = 6,
     agpe_long_step: int = 2,
     agpe_long_cos_thresh: float = 0.70,
-    agpe_long_weight: float = 0.50,
+    agpe_long_weight: float = 0.35,
     agpe_edge_tau_p: float = 0.25,
-    agpe_lift_sigma: float = 3.0,
+    agpe_lift_sigma: float = 2.2,
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Skeleton-graph diffusion with fallback to graph_lattice."""
@@ -284,6 +311,7 @@ def skeleton_graph_reliability_2d(
             tau=tau,
             kappa=kappa,
             sigma_st=sigma_st,
+            well_soft_alpha=well_soft_alpha,
             damp=None if damp is None else damp[bidx:bidx + 1],
             use_tensor_strength=use_tensor_strength,
             tensor_strength_power=tensor_strength_power,
@@ -318,14 +346,17 @@ def skeleton_graph_reliability_2d(
         is_long_np = graph["is_long"]
 
         # map well seeds to skeleton nodes; if none can be snapped, fallback
-        wm_np = (well_mask[b, 0].detach().cpu().numpy() > 0.5)
+        wm_np = well_mask[b, 0].detach().cpu().numpy()
         seed_rc = np.argwhere(wm_np)
-        seed_nodes: set[int] = set()
+        seed_nodes: dict[int, float] = {}
         snap_radius = max(int(agpe_skel_snap_radius), 0)
         for r0, c0 in seed_rc:
+            wv = float(wm_np[int(r0), int(c0)])
+            if wv <= 0.0:
+                continue
             idx = int(node_map[r0, c0])
             if idx >= 0:
-                seed_nodes.add(idx)
+                seed_nodes[idx] = max(seed_nodes.get(idx, 0.0), wv)
                 continue
             if snap_radius <= 0:
                 continue
@@ -343,7 +374,7 @@ def skeleton_graph_reliability_2d(
             best = cand[int(np.argmin(d2))]
             best_idx = int(node_map[int(best[0]), int(best[1])])
             if best_idx >= 0:
-                seed_nodes.add(best_idx)
+                seed_nodes[best_idx] = max(seed_nodes.get(best_idx, 0.0), wv)
 
         if not seed_nodes:
             r_out[b, 0] = _fallback_one(b)
@@ -412,11 +443,24 @@ def skeleton_graph_reliability_2d(
         m = int(node_rc.shape[0])
         r0 = torch.zeros((m,), dtype=well_mask.dtype, device=device)
         wm_node = torch.zeros_like(r0)
-        seed_idx = torch.tensor(sorted(seed_nodes), dtype=torch.long, device=device)
-        r0[seed_idx] = 1.0
-        wm_node[seed_idx] = 1.0
+        seed_keys = sorted(seed_nodes.keys())
+        seed_idx = torch.tensor(seed_keys, dtype=torch.long, device=device)
+        seed_val = torch.tensor([seed_nodes[int(k)] for k in seed_keys], dtype=well_mask.dtype, device=device)
+        seed_val = seed_val.clamp(0.0, 1.0)
+        r0[seed_idx] = seed_val
+        wm_node[seed_idx] = seed_val
 
-        r_nodes = graph_diffuse(r0, wm_node, src, dst, w, steps=steps, eta=eta, eps=eps)
+        r_nodes = graph_diffuse(
+            r0,
+            wm_node,
+            src,
+            dst,
+            w,
+            steps=steps,
+            eta=eta,
+            well_soft_alpha=well_soft_alpha,
+            eps=eps,
+        )
         r_grid_np = lift_nodes_to_grid(
             r_nodes.detach().cpu().numpy().astype(np.float32),
             node_map=node_map,
@@ -424,7 +468,7 @@ def skeleton_graph_reliability_2d(
             lift_sigma=float(agpe_lift_sigma),
         )
         r_grid = torch.from_numpy(r_grid_np).to(device=device, dtype=well_mask.dtype)
-        r_grid = torch.maximum(r_grid, well_mask[b, 0])
+        r_grid = _apply_well_constraint(r_grid, well_mask[b, 0], well_soft_alpha)
         r_out[b, 0] = r_grid.clamp(0.0, 1.0)
 
     return r_out, v
@@ -434,23 +478,26 @@ def _snap_well_seeds_to_skeleton(
     well_mask_2d: np.ndarray,
     node_map: np.ndarray,
     snap_radius: int,
-) -> tuple[np.ndarray, int, int]:
+) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Map 2D well seeds to skeleton nodes with optional local snapping."""
     wm_np = np.asarray(well_mask_2d, dtype=np.float32)
     node_map = np.asarray(node_map, dtype=np.int32)
     il, xl = node_map.shape
 
-    seed_rc = np.argwhere(wm_np > 0.5)
+    seed_rc = np.argwhere(wm_np > 0.0)
     if seed_rc.size == 0:
-        return np.empty((0,), dtype=np.int64), 0, 0
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float32), 0, 0
 
-    seed_nodes: set[int] = set()
+    seed_nodes: dict[int, float] = {}
     snap_ok = 0
     r_snap = max(int(snap_radius), 0)
     for r0, c0 in seed_rc:
+        wv = float(wm_np[int(r0), int(c0)])
+        if wv <= 0.0:
+            continue
         idx = int(node_map[int(r0), int(c0)])
         if idx >= 0:
-            seed_nodes.add(idx)
+            seed_nodes[idx] = max(seed_nodes.get(idx, 0.0), wv)
             snap_ok += 1
             continue
         if r_snap <= 0:
@@ -470,14 +517,16 @@ def _snap_well_seeds_to_skeleton(
         best = cand[int(np.argmin(d2))]
         best_idx = int(node_map[int(best[0]), int(best[1])])
         if best_idx >= 0:
-            seed_nodes.add(best_idx)
+            seed_nodes[best_idx] = max(seed_nodes.get(best_idx, 0.0), wv)
             snap_ok += 1
 
     if not seed_nodes:
-        return np.empty((0,), dtype=np.int64), int(seed_rc.shape[0]), int(snap_ok)
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float32), int(seed_rc.shape[0]), int(snap_ok)
 
-    seed_idx = np.asarray(sorted(seed_nodes), dtype=np.int64)
-    return seed_idx, int(seed_rc.shape[0]), int(snap_ok)
+    seed_idx = np.asarray(sorted(seed_nodes.keys()), dtype=np.int64)
+    seed_val = np.asarray([seed_nodes[int(k)] for k in seed_idx], dtype=np.float32)
+    seed_val = np.clip(seed_val, 0.0, 1.0)
+    return seed_idx, seed_val, int(seed_rc.shape[0]), int(snap_ok)
 
 
 def _ensure_probs(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -521,16 +570,21 @@ def build_R_and_prior_from_cube(
     aniso_use_tensor_strength: bool = True,
     aniso_tensor_strength_power: float = 1.0,
     # --- skeleton graph params ---
-    agpe_skel_p_thresh: float = 0.60,
+    agpe_skel_p_thresh: float = 0.55,
     agpe_skel_min_nodes: int = 30,
     agpe_skel_snap_radius: int = 5,
     agpe_long_edges: bool = True,
     agpe_long_max_step: int = 6,
     agpe_long_step: int = 2,
     agpe_long_cos_thresh: float = 0.70,
-    agpe_long_weight: float = 0.50,
+    agpe_long_weight: float = 0.35,
     agpe_edge_tau_p: float = 0.25,
-    agpe_lift_sigma: float = 3.0,
+    agpe_lift_sigma: float = 2.2,
+    agpe_well_seed_mode: str = "hard",     # "hard" | "depth_gate"
+    agpe_well_seed_power: float = 1.0,
+    agpe_well_seed_min: float = 0.02,
+    agpe_well_seed_use_conf: bool = True,
+    agpe_well_soft_alpha: float = 0.20,
     agpe_cache_graph: bool = True,
     agpe_refine_graph: bool = True,
     agpe_rebuild_every: int = 50,
@@ -560,11 +614,11 @@ def build_R_and_prior_from_cube(
     H, IL, XL = seismic_3d.shape
     N = IL * XL
 
-    # seeds: wells are entire traces (all depths) here
-    well_mask_3d = torch.zeros((H, IL, XL), device=device, dtype=torch.float32)
+    # well trace locations (depth weighting is applied after p_channel/conf are prepared)
+    well_seed_base = torch.zeros((H, IL, XL), device=device, dtype=torch.float32)
     ii = (well_trace_indices // XL).long()
     jj = (well_trace_indices % XL).long()
-    well_mask_3d[:, ii, jj] = 1.0
+    well_seed_base[:, ii, jj] = 1.0
 
     # ---------- build p_channel and conf ----------
     # 1) prior channel probability (hard)
@@ -610,6 +664,22 @@ def build_R_and_prior_from_cube(
         conf = torch.ones_like(p_pred)
 
     pch = torch.where(conf >= float(conf_thresh), p_mix, p_fallback).clamp(0.0, 1.0)
+
+    # ---------- depth-gated well seed injection ----------
+    seed_mode = str(agpe_well_seed_mode).strip().lower()
+    seed_power = max(float(agpe_well_seed_power), 0.0)
+    seed_min = float(np.clip(float(agpe_well_seed_min), 0.0, 1.0))
+    if seed_mode == "depth_gate":
+        seed_w = pch.clamp(0.0, 1.0)
+        if bool(agpe_well_seed_use_conf):
+            seed_w = seed_w * conf.clamp(0.0, 1.0)
+        if abs(seed_power - 1.0) > 1e-8:
+            seed_w = seed_w.pow(seed_power)
+        if seed_min > 0.0:
+            seed_w = seed_w.clamp(min=seed_min, max=1.0)
+        well_mask_3d = well_seed_base * seed_w
+    else:
+        well_mask_3d = well_seed_base
 
     # ---------- waveform/attribute embedding for similarity ----------
     amp = seismic_3d
@@ -673,6 +743,7 @@ def build_R_and_prior_from_cube(
                 tau=tau,
                 kappa=kappa,
                 sigma_st=sigma_st,
+                well_soft_alpha=float(agpe_well_soft_alpha),
                 damp=dk,
             )
         elif backend_name == "graph_lattice":
@@ -686,6 +757,7 @@ def build_R_and_prior_from_cube(
                 tau=tau,
                 kappa=kappa,
                 sigma_st=sigma_st,
+                well_soft_alpha=float(agpe_well_soft_alpha),
                 damp=dk,
                 use_tensor_strength=bool(aniso_use_tensor_strength),
                 tensor_strength_power=float(aniso_tensor_strength_power),
@@ -759,6 +831,7 @@ def build_R_and_prior_from_cube(
                     tau=tau,
                     kappa=kappa,
                     sigma_st=sigma_st,
+                    well_soft_alpha=float(agpe_well_soft_alpha),
                     damp=dk,
                     use_tensor_strength=bool(aniso_use_tensor_strength),
                     tensor_strength_power=float(aniso_tensor_strength_power),
@@ -766,7 +839,7 @@ def build_R_and_prior_from_cube(
                 )
                 graph_stats["fallback_slices"] += 1.0
             else:
-                seed_idx_np, seed_total, snap_ok = _snap_well_seeds_to_skeleton(
+                seed_idx_np, seed_val_np, seed_total, snap_ok = _snap_well_seeds_to_skeleton(
                     well_mask_2d=wm[0, 0].detach().cpu().numpy(),
                     node_map=cache_slice.node_map,
                     snap_radius=int(agpe_skel_snap_radius),
@@ -787,6 +860,7 @@ def build_R_and_prior_from_cube(
                         tau=tau,
                         kappa=kappa,
                         sigma_st=sigma_st,
+                        well_soft_alpha=float(agpe_well_soft_alpha),
                         damp=dk,
                         use_tensor_strength=bool(aniso_use_tensor_strength),
                         tensor_strength_power=float(aniso_tensor_strength_power),
@@ -818,10 +892,21 @@ def build_R_and_prior_from_cube(
                     r0 = torch.zeros((node_n,), device=device, dtype=torch.float32)
                     wm_node = torch.zeros_like(r0)
                     seed_idx = torch.from_numpy(seed_idx_np).to(device=device, dtype=torch.long)
-                    r0[seed_idx] = 1.0
-                    wm_node[seed_idx] = 1.0
+                    seed_val = torch.from_numpy(seed_val_np).to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+                    r0[seed_idx] = seed_val
+                    wm_node[seed_idx] = seed_val
 
-                    r_nodes = graph_diffuse(r0, wm_node, src, dst, w, steps=steps_R, eta=eta, eps=eps)
+                    r_nodes = graph_diffuse(
+                        r0,
+                        wm_node,
+                        src,
+                        dst,
+                        w,
+                        steps=steps_R,
+                        eta=eta,
+                        well_soft_alpha=float(agpe_well_soft_alpha),
+                        eps=eps,
+                    )
                     r_grid_np = lift_nodes_to_grid_cached(
                         r_nodes=r_nodes.detach().cpu().numpy().astype(np.float32),
                         lift_nearest_idx=cache_slice.lift_nearest_idx,
@@ -829,7 +914,7 @@ def build_R_and_prior_from_cube(
                         lift_sigma=float(agpe_lift_sigma),
                     )
                     r_grid = torch.from_numpy(r_grid_np).to(device=device, dtype=torch.float32)
-                    r_grid = torch.maximum(r_grid, wm[0, 0])
+                    r_grid = _apply_well_constraint(r_grid, wm[0, 0], float(agpe_well_soft_alpha))
                     Rk = r_grid.unsqueeze(0).unsqueeze(0).clamp(0.0, 1.0)
 
                     cache_slice.pch_prev = pch_np.copy()
