@@ -22,7 +22,24 @@ TCN1D_train_p = {
     'stageA_lambda_facies_mult': 0.30,
     'stageA_lambda_recon_mult': 0.30,
     'lambda_amp_anchor': 0.05,
+    # Step-3.1: depth-detail preservation (anti over-layered smoothing)
+    'lambda_depth_grad': 0.20,
+    'lambda_depth_hf': 0.10,
+    'depth_detail_norm': 'l1',   # l1 | l2
+    'hf_second_order': True,
+    # Step-3.2: facies-boundary-aware weighted supervision
+    'use_boundary_weight': True,
+    'boundary_weight_beta': 1.5,
+    'boundary_weight_width': 2,
+    'boundary_weight_max': 4.0,
+    'boundary_weight_apply_ai': True,
+    'boundary_weight_apply_detail': True,
+    'boundary_weight_apply_facies': False,
     'facies_detach_y': False,
+    # Step-3.3: late multi-task decoupling (dynamic facies detach + WS tightening)
+    'use_late_multitask_decouple': True,
+    'late_multitask_start_epoch': 450,
+    'facies_detach_y_late': True,
     'SGS_data_n': 1000,
     'epochs': 1000,
     'grad_clip': 1.0,
@@ -36,6 +53,8 @@ TCN1D_train_p = {
     'ws_every': 2,
     'ws_max_batches': 150,
     'ws_max_batches_stageA': 50,
+    'ws_every_late': 10,
+    'ws_max_batches_late': 15,
     'seed': SEED,
     'selected_wells_csv': SELECTED_WELLS_CSV,
 

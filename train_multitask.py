@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from model.CNN2Layer import VishalNet
@@ -512,7 +513,26 @@ def train(train_p: dict):
     stageA_lambda_facies_mult = float(train_p.get("stageA_lambda_facies_mult", 0.30))
     stageA_lambda_recon_mult = float(train_p.get("stageA_lambda_recon_mult", 0.30))
     lambda_amp_anchor = float(train_p.get("lambda_amp_anchor", 0.05))
+    # Depth-detail preservation to suppress over-layered smoothing.
+    lambda_depth_grad = float(train_p.get("lambda_depth_grad", 0.20))
+    lambda_depth_hf = float(train_p.get("lambda_depth_hf", 0.10))
+    depth_detail_norm = str(train_p.get("depth_detail_norm", "l1")).strip().lower()
+    hf_second_order = bool(train_p.get("hf_second_order", True))
+    # Step-3.2: facies-boundary-aware supervision weighting.
+    use_boundary_weight = bool(train_p.get("use_boundary_weight", True))
+    boundary_weight_beta = float(train_p.get("boundary_weight_beta", 1.5))
+    boundary_weight_width = int(train_p.get("boundary_weight_width", 2))
+    boundary_weight_max = float(train_p.get("boundary_weight_max", 4.0))
+    boundary_weight_apply_ai = bool(train_p.get("boundary_weight_apply_ai", True))
+    boundary_weight_apply_detail = bool(train_p.get("boundary_weight_apply_detail", True))
+    boundary_weight_apply_facies = bool(train_p.get("boundary_weight_apply_facies", False))
     facies_detach_y = bool(train_p.get("facies_detach_y", True))
+    # Step-3.3: late multi-task decoupling (dynamic facies detach + tighter weak-supervision).
+    use_late_multitask_decouple = bool(train_p.get("use_late_multitask_decouple", False))
+    late_multitask_start_epoch = int(
+        train_p.get("late_multitask_start_epoch", max(0, stageA_epochs + stageB_ramp_epochs))
+    )
+    facies_detach_y_late = bool(train_p.get("facies_detach_y_late", True))
     grad_clip = float(train_p.get("grad_clip", 0.0))
 
     optimizer = torch.optim.Adam(
@@ -525,6 +545,8 @@ def train(train_p: dict):
     ws_every = int(train_p.get("ws_every", 5))
     ws_max_batches = int(train_p.get("ws_max_batches", 50))
     ws_max_batches_stageA = int(train_p.get("ws_max_batches_stageA", max(10, ws_max_batches // 3)))
+    ws_every_late = int(train_p.get("ws_every_late", ws_every))
+    ws_max_batches_late = int(train_p.get("ws_max_batches_late", max(1, ws_max_batches // 3)))
 
     # iterative R scheduling (recommended)
     iterative_R = bool(train_p.get("iterative_R", False)) and (R_prev_flat is not None)
@@ -565,6 +587,81 @@ def train(train_p: dict):
         rec_t = lam_rec_A * (1.0 - t) + lam_rec * t
         return ai_t, fac_t, rec_t
 
+    def _is_late_multitask(epoch: int) -> bool:
+        return bool(use_late_multitask_decouple) and (int(epoch) >= int(late_multitask_start_epoch))
+
+    def _facies_detach_flag(epoch: int) -> bool:
+        if bool(facies_detach_y):
+            return True
+        if _is_late_multitask(epoch):
+            return bool(facies_detach_y_late)
+        return False
+
+    def _ws_schedule(epoch: int) -> tuple[int, int]:
+        cap = ws_max_batches_stageA if (use_two_stage_loss and epoch < max(0, stageA_epochs)) else ws_max_batches
+        every = ws_every
+        if _is_late_multitask(epoch):
+            if int(ws_every_late) > 0:
+                every = int(ws_every_late)
+            if int(ws_max_batches_late) >= 0:
+                cap = min(int(cap), int(ws_max_batches_late))
+        return int(every), int(cap)
+
+    def _depth_diff(x: torch.Tensor) -> torch.Tensor:
+        # First-order depth gradient.
+        return x[..., 1:] - x[..., :-1]
+
+    def _depth_hf(x: torch.Tensor) -> torch.Tensor:
+        # Second-order depth residual acts as a lightweight high-pass signal.
+        if bool(hf_second_order) and x.shape[-1] >= 3:
+            return x[..., 2:] - (2.0 * x[..., 1:-1]) + x[..., :-2]
+        return _depth_diff(x)
+
+    def _detail_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if depth_detail_norm == "l2":
+            return torch.mean((pred - target) ** 2)
+        return torch.mean(torch.abs(pred - target))
+
+    def _build_boundary_weight(z_label: torch.Tensor) -> torch.Tensor:
+        """
+        z_label: [B,H] or [B,1,H] int facies labels
+        returns: [B,H] float weight >= 1
+        """
+        z2 = z_label.squeeze(1) if z_label.dim() == 3 else z_label
+        if z2.dim() != 2:
+            raise ValueError(f"Expected z_label dim=2/3, got shape={tuple(z_label.shape)}")
+
+        bmask = torch.zeros_like(z2, dtype=torch.float32)
+        right_change = (z2[:, 1:] != z2[:, :-1]).float()
+        bmask[:, 1:] = torch.maximum(bmask[:, 1:], right_change)
+        bmask[:, :-1] = torch.maximum(bmask[:, :-1], right_change)
+
+        width = max(int(boundary_weight_width), 0)
+        if width > 0:
+            k = 2 * width + 1
+            bmask = F.max_pool1d(bmask.unsqueeze(1), kernel_size=k, stride=1, padding=width).squeeze(1)
+
+        w = 1.0 + float(boundary_weight_beta) * bmask
+        if float(boundary_weight_max) > 1.0:
+            w = w.clamp(max=float(boundary_weight_max))
+        return w
+
+    def _weighted_reduce(err_map: torch.Tensor, weight_map: torch.Tensor | None) -> torch.Tensor:
+        if weight_map is None:
+            return err_map.mean()
+        w = weight_map.to(dtype=err_map.dtype, device=err_map.device)
+        return (err_map * w).sum() / (w.sum() + 1e-8)
+
+    def _weighted_mse(pred: torch.Tensor, target: torch.Tensor, weight_map: torch.Tensor | None) -> torch.Tensor:
+        return _weighted_reduce((pred - target) ** 2, weight_map)
+
+    def _detail_loss_weighted(pred: torch.Tensor, target: torch.Tensor, weight_map: torch.Tensor | None) -> torch.Tensor:
+        if depth_detail_norm == "l2":
+            err = (pred - target) ** 2
+        else:
+            err = torch.abs(pred - target)
+        return _weighted_reduce(err, weight_map)
+
     @torch.no_grad()
     def update_R(epoch: int) -> None:
         """Recompute p_channel/conf/residual from current models, then rebuild R and EMA-update."""
@@ -595,6 +692,7 @@ def train(train_p: dict):
         pch = np.zeros((N, Hs), dtype=np.float32)
         conf = np.zeros((N, Hs), dtype=np.float32)
         pres = np.zeros((N, Hs), dtype=np.float32)
+        fac_detach_t = _facies_detach_flag(epoch)
 
         mem = 0
         for x, y_gt, z_gt in all_ld:
@@ -602,7 +700,7 @@ def train(train_p: dict):
             y_pred = inverse_model(x)
             x_rec = forward_model(y_pred)
 
-            fac_in = y_pred.detach() if facies_detach_y else y_pred
+            fac_in = y_pred.detach() if fac_detach_t else y_pred
             logits = Facies_model(fac_in)  # [B,K,H]
             probs = torch.softmax(logits, dim=1)
             pch_b = probs[:, int(train_p.get("channel_id", 2)), :].detach().cpu().numpy()
@@ -725,12 +823,21 @@ def train(train_p: dict):
     for epoch in range(int(train_p.get("epochs", 1000))):
         update_R(epoch)
         lam_ai_t, lam_fac_t, lam_rec_t = _loss_weights(epoch)
-        ws_cap_t = ws_max_batches_stageA if (use_two_stage_loss and epoch < max(0, stageA_epochs)) else ws_max_batches
-        if epoch == 0 or epoch == stageA_epochs or epoch == (stageA_epochs + stageB_ramp_epochs):
+        ws_every_t, ws_cap_t = _ws_schedule(epoch)
+        fac_detach_t = _facies_detach_flag(epoch)
+        if (
+            epoch == 0
+            or epoch == stageA_epochs
+            or epoch == (stageA_epochs + stageB_ramp_epochs)
+            or (use_late_multitask_decouple and epoch == late_multitask_start_epoch)
+        ):
             print(
                 f"[LOSS-SCHED] epoch={epoch} "
                 f"lam_ai={lam_ai_t:.3f} lam_fac={lam_fac_t:.3f} lam_rec={lam_rec_t:.3f} "
-                f"ws_max_batches={ws_cap_t} lambda_amp_anchor={lambda_amp_anchor:.4f}"
+                f"ws_every={ws_every_t} ws_max_batches={ws_cap_t} lambda_amp_anchor={lambda_amp_anchor:.4f} "
+                f"lambda_depth_grad={lambda_depth_grad:.4f} lambda_depth_hf={lambda_depth_hf:.4f} "
+                f"boundary_weight={int(use_boundary_weight)} beta={boundary_weight_beta:.2f} width={boundary_weight_width} "
+                f"facies_detach={int(fac_detach_t)} late_decouple={int(_is_late_multitask(epoch))}"
             )
 
         inverse_model.train()
@@ -738,7 +845,7 @@ def train(train_p: dict):
         Facies_model.train()
 
         # weak supervision (Scheme A)
-        if (ws_every > 0) and ((epoch % ws_every) == 0):
+        if (ws_every_t > 0) and ((epoch % ws_every_t) == 0):
             ws_running = 0.0
             ws_batches = 0
             for bi, batch in enumerate(Wsupervised_loader):
@@ -759,7 +866,7 @@ def train(train_p: dict):
 
                 y_pred = inverse_model(x)
                 x_rec = forward_model(y_pred)
-                fac_in = y_pred.detach() if facies_detach_y else y_pred
+                fac_in = y_pred.detach() if fac_detach_t else y_pred
                 fac_logits = Facies_model(fac_in)
 
                 loss_ws = (lam_fac_t * criterion_facies(fac_logits, z)) + (lam_rec_t * criterion_rec(x_rec, x[:, 0:1, :]))
@@ -795,12 +902,51 @@ def train(train_p: dict):
 
             y_pred = inverse_model(x)
             x_rec = forward_model(y_pred)
-            fac_in = y_pred.detach() if facies_detach_y else y_pred
+            fac_in = y_pred.detach() if fac_detach_t else y_pred
             fac_logits = Facies_model(fac_in)
 
-            l_ai = criterion_ai(y_pred, y)
-            l_fac = criterion_facies(fac_logits, z)
+            boundary_w = None
+            if use_boundary_weight:
+                boundary_w = _build_boundary_weight(z)
+
+            # Supervised AI loss with optional boundary emphasis.
+            if (boundary_w is not None) and boundary_weight_apply_ai:
+                l_ai = _weighted_mse(y_pred, y, boundary_w.unsqueeze(1))
+            else:
+                l_ai = criterion_ai(y_pred, y)
+
+            if (boundary_w is not None) and boundary_weight_apply_facies:
+                ce_map = F.cross_entropy(fac_logits, z, reduction="none")  # [B,H]
+                l_fac = _weighted_reduce(ce_map, boundary_w)
+            else:
+                l_fac = criterion_facies(fac_logits, z)
             l_rec = criterion_rec(x_rec, x[:, 0:1, :])
+            l_dgrad = torch.tensor(0.0, device=device)
+            l_dhf = torch.tensor(0.0, device=device)
+            if lambda_depth_grad > 0:
+                d_pred = _depth_diff(y_pred)
+                d_true = _depth_diff(y)
+                if (boundary_w is not None) and boundary_weight_apply_detail:
+                    w_d = torch.maximum(boundary_w[:, 1:], boundary_w[:, :-1]).unsqueeze(1)
+                else:
+                    w_d = None
+                l_dgrad = _detail_loss_weighted(d_pred, d_true, w_d)
+            if lambda_depth_hf > 0:
+                h_pred = _depth_hf(y_pred)
+                h_true = _depth_hf(y)
+                if (boundary_w is not None) and boundary_weight_apply_detail:
+                    if h_pred.shape[-1] == (boundary_w.shape[-1] - 2):
+                        w_h = torch.maximum(
+                            boundary_w[:, 2:],
+                            torch.maximum(boundary_w[:, 1:-1], boundary_w[:, :-2]),
+                        ).unsqueeze(1)
+                    elif h_pred.shape[-1] == (boundary_w.shape[-1] - 1):
+                        w_h = torch.maximum(boundary_w[:, 1:], boundary_w[:, :-1]).unsqueeze(1)
+                    else:
+                        w_h = boundary_w[:, :h_pred.shape[-1]].unsqueeze(1)
+                else:
+                    w_h = None
+                l_dhf = _detail_loss_weighted(h_pred, h_true, w_h)
             # Amplitude anchor: penalize global mean/std drift to reduce polarity/scale branch flips.
             amp_anchor = torch.tensor(0.0, device=device)
             if lambda_amp_anchor > 0:
@@ -810,7 +956,14 @@ def train(train_p: dict):
                 true_std = y.std(dim=(1, 2), unbiased=False)
                 amp_anchor = ((pred_mean - true_mean) ** 2 + (pred_std - true_std) ** 2).mean()
 
-            loss = (lam_ai_t * l_ai) + (lam_fac_t * l_fac) + (lam_rec_t * l_rec) + (lambda_amp_anchor * amp_anchor)
+            loss = (
+                (lam_ai_t * l_ai)
+                + (lam_fac_t * l_fac)
+                + (lam_rec_t * l_rec)
+                + (lambda_amp_anchor * amp_anchor)
+                + (lambda_depth_grad * l_dgrad)
+                + (lambda_depth_hf * l_dhf)
+            )
             loss.backward()
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
