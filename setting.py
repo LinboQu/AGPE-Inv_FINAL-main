@@ -27,11 +27,22 @@ TCN1D_train_p = {
     'lambda_depth_hf': 0.10,
     'depth_detail_norm': 'l1',   # l1 | l2
     'hf_second_order': True,
+    # Optional late-start ramp for depth-detail losses.
+    # target = lambda_depth_grad / lambda_depth_hf, scaled by warm factor in training.
+    'use_depth_warm_schedule': False,
+    'depth_warm_start_epoch': 0,
+    'depth_warm_ramp_epochs': 1,
     # Step-3.2: facies-boundary-aware weighted supervision
     'use_boundary_weight': True,
     'boundary_weight_beta': 1.5,
     'boundary_weight_width': 2,
     'boundary_weight_max': 4.0,
+    # Optional late-start ramp for boundary beta.
+    'use_boundary_warm_schedule': False,
+    'boundary_beta_start': 1.5,
+    'boundary_beta_end': 1.5,
+    'boundary_warm_start_epoch': 0,
+    'boundary_warm_ramp_epochs': 1,
     'boundary_weight_apply_ai': True,
     'boundary_weight_apply_detail': True,
     'boundary_weight_apply_facies': False,

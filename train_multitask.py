@@ -529,9 +529,17 @@ def train(train_p: dict):
     lambda_depth_hf = float(train_p.get("lambda_depth_hf", 0.10))
     depth_detail_norm = str(train_p.get("depth_detail_norm", "l1")).strip().lower()
     hf_second_order = bool(train_p.get("hf_second_order", True))
+    use_depth_warm_schedule = bool(train_p.get("use_depth_warm_schedule", False))
+    depth_warm_start_epoch = int(train_p.get("depth_warm_start_epoch", 0))
+    depth_warm_ramp_epochs = int(train_p.get("depth_warm_ramp_epochs", 1))
     # Step-3.2: facies-boundary-aware supervision weighting.
     use_boundary_weight = bool(train_p.get("use_boundary_weight", True))
     boundary_weight_beta = float(train_p.get("boundary_weight_beta", 1.5))
+    use_boundary_warm_schedule = bool(train_p.get("use_boundary_warm_schedule", False))
+    boundary_beta_start = float(train_p.get("boundary_beta_start", boundary_weight_beta))
+    boundary_beta_end = float(train_p.get("boundary_beta_end", boundary_weight_beta))
+    boundary_warm_start_epoch = int(train_p.get("boundary_warm_start_epoch", 0))
+    boundary_warm_ramp_epochs = int(train_p.get("boundary_warm_ramp_epochs", 1))
     boundary_weight_width = int(train_p.get("boundary_weight_width", 2))
     boundary_weight_max = float(train_p.get("boundary_weight_max", 4.0))
     boundary_weight_apply_ai = bool(train_p.get("boundary_weight_apply_ai", True))
@@ -618,6 +626,26 @@ def train(train_p: dict):
                 cap = min(int(cap), int(ws_max_batches_late))
         return int(every), int(cap)
 
+    def _linear_warm_factor(epoch: int, start_epoch: int, ramp_epochs: int) -> float:
+        if epoch < int(start_epoch):
+            return 0.0
+        if int(ramp_epochs) <= 0:
+            return 1.0
+        t = (epoch - int(start_epoch)) / float(max(1, int(ramp_epochs)))
+        return min(1.0, max(0.0, t))
+
+    def _depth_loss_coeff(epoch: int) -> tuple[float, float]:
+        if not bool(use_depth_warm_schedule):
+            return float(lambda_depth_grad), float(lambda_depth_hf)
+        warm = _linear_warm_factor(epoch, depth_warm_start_epoch, depth_warm_ramp_epochs)
+        return float(lambda_depth_grad) * warm, float(lambda_depth_hf) * warm
+
+    def _boundary_beta(epoch: int) -> float:
+        if not bool(use_boundary_warm_schedule):
+            return float(boundary_weight_beta)
+        warm = _linear_warm_factor(epoch, boundary_warm_start_epoch, boundary_warm_ramp_epochs)
+        return float(boundary_beta_start) * (1.0 - warm) + float(boundary_beta_end) * warm
+
     def _depth_diff(x: torch.Tensor) -> torch.Tensor:
         # First-order depth gradient.
         return x[..., 1:] - x[..., :-1]
@@ -633,7 +661,7 @@ def train(train_p: dict):
             return torch.mean((pred - target) ** 2)
         return torch.mean(torch.abs(pred - target))
 
-    def _build_boundary_weight(z_label: torch.Tensor) -> torch.Tensor:
+    def _build_boundary_weight(z_label: torch.Tensor, beta: float) -> torch.Tensor:
         """
         z_label: [B,H] or [B,1,H] int facies labels
         returns: [B,H] float weight >= 1
@@ -652,7 +680,7 @@ def train(train_p: dict):
             k = 2 * width + 1
             bmask = F.max_pool1d(bmask.unsqueeze(1), kernel_size=k, stride=1, padding=width).squeeze(1)
 
-        w = 1.0 + float(boundary_weight_beta) * bmask
+        w = 1.0 + float(beta) * bmask
         if float(boundary_weight_max) > 1.0:
             w = w.clamp(max=float(boundary_weight_max))
         return w
@@ -836,18 +864,22 @@ def train(train_p: dict):
         lam_ai_t, lam_fac_t, lam_rec_t = _loss_weights(epoch)
         ws_every_t, ws_cap_t = _ws_schedule(epoch)
         fac_detach_t = _facies_detach_flag(epoch)
+        lambda_depth_grad_t, lambda_depth_hf_t = _depth_loss_coeff(epoch)
+        boundary_beta_t = _boundary_beta(epoch)
         if (
             epoch == 0
             or epoch == stageA_epochs
             or epoch == (stageA_epochs + stageB_ramp_epochs)
             or (use_late_multitask_decouple and epoch == late_multitask_start_epoch)
+            or (use_depth_warm_schedule and epoch == depth_warm_start_epoch)
+            or (use_boundary_warm_schedule and epoch == boundary_warm_start_epoch)
         ):
             print(
                 f"[LOSS-SCHED] epoch={epoch} "
                 f"lam_ai={lam_ai_t:.3f} lam_fac={lam_fac_t:.3f} lam_rec={lam_rec_t:.3f} "
                 f"ws_every={ws_every_t} ws_max_batches={ws_cap_t} lambda_amp_anchor={lambda_amp_anchor:.4f} "
-                f"lambda_depth_grad={lambda_depth_grad:.4f} lambda_depth_hf={lambda_depth_hf:.4f} "
-                f"boundary_weight={int(use_boundary_weight)} beta={boundary_weight_beta:.2f} width={boundary_weight_width} "
+                f"lambda_depth_grad={lambda_depth_grad_t:.4f} lambda_depth_hf={lambda_depth_hf_t:.4f} "
+                f"boundary_weight={int(use_boundary_weight)} beta={boundary_beta_t:.2f} width={boundary_weight_width} "
                 f"facies_detach={int(fac_detach_t)} late_decouple={int(_is_late_multitask(epoch))}"
             )
 
@@ -918,7 +950,7 @@ def train(train_p: dict):
 
             boundary_w = None
             if use_boundary_weight:
-                boundary_w = _build_boundary_weight(z)
+                boundary_w = _build_boundary_weight(z, beta=float(boundary_beta_t))
 
             # Supervised AI loss with optional boundary emphasis.
             if (boundary_w is not None) and boundary_weight_apply_ai:
@@ -934,7 +966,7 @@ def train(train_p: dict):
             l_rec = criterion_rec(x_rec, x[:, 0:1, :])
             l_dgrad = torch.tensor(0.0, device=device)
             l_dhf = torch.tensor(0.0, device=device)
-            if lambda_depth_grad > 0:
+            if lambda_depth_grad_t > 0:
                 d_pred = _depth_diff(y_pred)
                 d_true = _depth_diff(y)
                 if (boundary_w is not None) and boundary_weight_apply_detail:
@@ -942,7 +974,7 @@ def train(train_p: dict):
                 else:
                     w_d = None
                 l_dgrad = _detail_loss_weighted(d_pred, d_true, w_d)
-            if lambda_depth_hf > 0:
+            if lambda_depth_hf_t > 0:
                 h_pred = _depth_hf(y_pred)
                 h_true = _depth_hf(y)
                 if (boundary_w is not None) and boundary_weight_apply_detail:
@@ -972,8 +1004,8 @@ def train(train_p: dict):
                 + (lam_fac_t * l_fac)
                 + (lam_rec_t * l_rec)
                 + (lambda_amp_anchor * amp_anchor)
-                + (lambda_depth_grad * l_dgrad)
-                + (lambda_depth_hf * l_dhf)
+                + (lambda_depth_grad_t * l_dgrad)
+                + (lambda_depth_hf_t * l_dhf)
             )
             loss.backward()
             if grad_clip and grad_clip > 0:
