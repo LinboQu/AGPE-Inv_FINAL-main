@@ -4,6 +4,7 @@ CNN style model
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class CNN(nn.Module):
@@ -77,16 +78,69 @@ class VishalNet_par(nn.Module):
 #################  1-D Physics-based Model by Vishal Das et al. ###################################################
 class VishalNet(nn.Module):
 	'''
-		模型结构： Conv_1d(1*81) + ReLU + Conv_1d(1*301)
+		模型结构：
+			主干：Conv_1d(1*81) + ReLU + Conv_1d(1*301)
+			细节支路（可选）：在高通输入上做轻量卷积，输出残差细节
+			输出：main + detail_gain * detail
 	'''
-	def __init__(self, input_dim=1):
+	def __init__(
+		self,
+		input_dim=1,
+		use_detail_branch=True,
+		detail_gain=0.15,
+		detail_hp_kernel=9,
+		detail_channels=24,
+		detail_dilations=(1, 2, 4),
+		detail_kernel_sizes=(9, 7, 5),
+	):
 		super(VishalNet, self).__init__()
 		self.cnn1 = nn.Conv1d(input_dim, 60, 81, 1, 40)    # 卷积核为81, padding=(k-1)/2
 		self.cnn2 = nn.Conv1d(60, 1, 301, 1, 150)  # 卷积核为301
+		self.use_detail_branch = bool(use_detail_branch)
+		self.detail_gain = float(detail_gain)
+		self.detail_hp_kernel = int(detail_hp_kernel)
+
+		dils = list(detail_dilations) if detail_dilations is not None else [1, 2, 4]
+		ks = list(detail_kernel_sizes) if detail_kernel_sizes is not None else [9, 7, 5]
+		if len(dils) < 2:
+			dils = [1, 2, 4]
+		if len(ks) < 2:
+			ks = [9, 7, 5]
+		if len(ks) < len(dils):
+			ks = ks + [ks[-1]] * (len(dils) - len(ks))
+		if len(dils) < len(ks):
+			dils = dils + [dils[-1]] * (len(ks) - len(dils))
+
+		if self.use_detail_branch:
+			ch = int(detail_channels) if int(detail_channels) > 0 else 24
+			k1, d1 = int(ks[0]), int(dils[0])
+			k2, d2 = int(ks[1]), int(dils[1])
+			if len(ks) >= 3:
+				k3, d3 = int(ks[2]), int(dils[2])
+			else:
+				k3, d3 = k2, d2
+			self.detail_conv1 = nn.Conv1d(input_dim, ch, k1, 1, (k1 // 2) * d1, dilation=d1)
+			self.detail_conv2 = nn.Conv1d(ch, ch, k2, 1, (k2 // 2) * d2, dilation=d2)
+			self.detail_conv3 = nn.Conv1d(ch, 1, k3, 1, (k3 // 2) * d3, dilation=d3)
 	
 	def forward(self, input):
-		out1 = nn.functional.relu(self.cnn1(input))
+		out1 = F.relu(self.cnn1(input))
 		out2 = self.cnn2(out1)
+
+		# 兼容旧模型对象：若没有细节分支属性则自动退化为原始VishalNet。
+		use_detail = bool(getattr(self, "use_detail_branch", False))
+		has_detail = hasattr(self, "detail_conv1") and hasattr(self, "detail_conv2") and hasattr(self, "detail_conv3")
+		if use_detail and has_detail:
+			hp = input
+			k = int(getattr(self, "detail_hp_kernel", 0))
+			if (k >= 3) and ((k % 2) == 1):
+				lp = F.avg_pool1d(hp, kernel_size=k, stride=1, padding=k // 2)
+				hp = hp - lp
+			d = F.relu(self.detail_conv1(hp))
+			d = F.relu(self.detail_conv2(d))
+			d = self.detail_conv3(d)
+			g = float(getattr(self, "detail_gain", 0.0))
+			out2 = out2 + g * d
 		return out2
 
 class CNN_R(nn.Module):

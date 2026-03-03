@@ -91,6 +91,47 @@ CASE_PRESETS: Dict[str, Dict[str, object]] = {
         "agpe_rebuild_every": 50,
         "run_id_suffix": "_skel_ref",
     },
+    # Isolation-A: Step-4 off (disable detail branch), keep everything else as skel_ref
+    "skel_ref_nodetail": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": True,
+        "iterative_R": True,
+        "agpe_cache_graph": True,
+        "agpe_refine_graph": True,
+        "agpe_rebuild_every": 50,
+        "use_detail_branch": False,
+        "run_id_suffix": "_skel_ref_nodetail",
+    },
+    # Isolation-B: Step-3 boundary/depth constraints off, keep detail branch on
+    "skel_ref_nobddep": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": True,
+        "iterative_R": True,
+        "agpe_cache_graph": True,
+        "agpe_refine_graph": True,
+        "agpe_rebuild_every": 50,
+        "use_boundary_weight": False,
+        "lambda_depth_grad": 0.0,
+        "lambda_depth_hf": 0.0,
+        "run_id_suffix": "_skel_ref_nobddep",
+    },
+    # Isolation-C: Step-3 boundary/depth constraints off + Step-4 detail branch off
+    "skel_ref_nodetail_nobddep": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": True,
+        "iterative_R": True,
+        "agpe_cache_graph": True,
+        "agpe_refine_graph": True,
+        "agpe_rebuild_every": 50,
+        "use_detail_branch": False,
+        "use_boundary_weight": False,
+        "lambda_depth_grad": 0.0,
+        "lambda_depth_hf": 0.0,
+        "run_id_suffix": "_skel_ref_nodetail_nobddep",
+    },
 }
 
 
@@ -236,6 +277,12 @@ def run_cases(cases: List[str], mode: str, epochs_override: int | None) -> None:
                     "agpe_well_seed_mode": str(train_cfg.get("agpe_well_seed_mode", "hard")),
                     "agpe_well_seed_min": float(train_cfg.get("agpe_well_seed_min", 0.0)),
                     "agpe_well_soft_alpha": float(train_cfg.get("agpe_well_soft_alpha", 1.0)),
+                    "use_detail_branch": bool(train_cfg.get("use_detail_branch", False)),
+                    "detail_gain": float(train_cfg.get("detail_gain", 0.0)),
+                    "detail_hp_kernel": int(train_cfg.get("detail_hp_kernel", 0)),
+                    "use_boundary_weight": bool(train_cfg.get("use_boundary_weight", False)),
+                    "lambda_depth_grad": float(train_cfg.get("lambda_depth_grad", 0.0)),
+                    "lambda_depth_hf": float(train_cfg.get("lambda_depth_hf", 0.0)),
                     "iterative_R": bool(train_cfg.get("iterative_R", False)),
                     **metrics,
                 }

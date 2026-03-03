@@ -487,13 +487,24 @@ def train(train_p: dict):
 
     # models
     in_ch = int(seismic.shape[1])
-    try:
-        inverse_model = choice_model(input_dim=in_ch).to(device)
-    except TypeError:
+    if model_name == "VishalNet":
+        inverse_model = choice_model(
+            input_dim=in_ch,
+            use_detail_branch=bool(train_p.get("use_detail_branch", True)),
+            detail_gain=float(train_p.get("detail_gain", 0.15)),
+            detail_hp_kernel=int(train_p.get("detail_hp_kernel", 9)),
+            detail_channels=int(train_p.get("detail_channels", 24)),
+            detail_dilations=tuple(train_p.get("detail_dilations", (1, 2, 4))),
+            detail_kernel_sizes=tuple(train_p.get("detail_kernel_sizes", (9, 7, 5))),
+        ).to(device)
+    else:
         try:
-            inverse_model = choice_model(in_ch).to(device)
+            inverse_model = choice_model(input_dim=in_ch).to(device)
         except TypeError:
-            inverse_model = choice_model().to(device)
+            try:
+                inverse_model = choice_model(in_ch).to(device)
+            except TypeError:
+                inverse_model = choice_model().to(device)
 
     forward_model = forward().to(device)
     Facies_model = Facies_class(facies_n=int(train_p.get("facies_n", 4))).to(device)

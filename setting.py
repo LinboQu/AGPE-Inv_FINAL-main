@@ -112,6 +112,13 @@ TCN1D_train_p = {
     'conf_thresh': 0.75,
     'lambda_phys_damp': 0.8,
     'save_R_every': 50,
+    # Step-4: structural anti-smoothing for VishalNet
+    'use_detail_branch': True,
+    'detail_gain': 0.15,
+    'detail_hp_kernel': 9,
+    'detail_channels': 24,
+    'detail_dilations': (1, 2, 4),
+    'detail_kernel_sizes': (9, 7, 5),
 
     # model config
     'model_name': 'VishalNet',
