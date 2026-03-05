@@ -428,6 +428,166 @@ ROUND3_DEFAULT_CASES: List[str] = [
 ]
 
 
+# -----------------------------
+# Round-4 matrix (centered on the current best case from round-3)
+# -----------------------------
+CASE_PRESETS.update(
+    {
+        # Anchor: best from round-3.
+        "r4_anchor_depth005001_late_amp005": {
+            "aniso_backend": "skeleton_graph",
+            "aniso_use_tensor_strength": True,
+            "agpe_long_edges": True,
+            "iterative_R": True,
+            "agpe_cache_graph": True,
+            "agpe_refine_graph": True,
+            "agpe_rebuild_every": 50,
+            "use_detail_branch": True,
+            "detail_gain": 0.15,
+            "lambda_amp_anchor": 0.05,
+            "use_boundary_weight": False,
+            "lambda_depth_grad": 0.005,
+            "lambda_depth_hf": 0.001,
+            "use_depth_warm_schedule": True,
+            "depth_warm_start_epoch": 500,
+            "depth_warm_ramp_epochs": 300,
+            "use_boundary_warm_schedule": False,
+            "run_id_suffix": "_prj4_anchor_depth005001_late_amp005",
+        },
+        # Test WS tightening effect alone on top of anchor.
+        "r4_anchor_ws_tight_nobw": {
+            "aniso_backend": "skeleton_graph",
+            "aniso_use_tensor_strength": True,
+            "agpe_long_edges": True,
+            "iterative_R": True,
+            "agpe_cache_graph": True,
+            "agpe_refine_graph": True,
+            "agpe_rebuild_every": 50,
+            "use_detail_branch": True,
+            "detail_gain": 0.15,
+            "lambda_amp_anchor": 0.05,
+            "use_boundary_weight": False,
+            "lambda_depth_grad": 0.005,
+            "lambda_depth_hf": 0.001,
+            "use_depth_warm_schedule": True,
+            "depth_warm_start_epoch": 500,
+            "depth_warm_ramp_epochs": 300,
+            "use_boundary_warm_schedule": False,
+            "ws_every": 4,
+            "ws_max_batches": 80,
+            "ws_max_batches_stageA": 30,
+            "ws_every_late": 12,
+            "ws_max_batches_late": 8,
+            "run_id_suffix": "_prj4_anchor_ws_tight_nobw",
+        },
+        # Recover boundary softly under WS-tight condition.
+        "r4_anchor_ws_tight_beta010": {
+            "aniso_backend": "skeleton_graph",
+            "aniso_use_tensor_strength": True,
+            "agpe_long_edges": True,
+            "iterative_R": True,
+            "agpe_cache_graph": True,
+            "agpe_refine_graph": True,
+            "agpe_rebuild_every": 50,
+            "use_detail_branch": True,
+            "detail_gain": 0.15,
+            "lambda_amp_anchor": 0.05,
+            "use_boundary_weight": True,
+            "boundary_weight_width": 1,
+            "boundary_weight_beta": 0.10,
+            "use_boundary_warm_schedule": True,
+            "boundary_beta_start": 0.0,
+            "boundary_beta_end": 0.10,
+            "boundary_warm_start_epoch": 500,
+            "boundary_warm_ramp_epochs": 300,
+            "lambda_depth_grad": 0.005,
+            "lambda_depth_hf": 0.001,
+            "use_depth_warm_schedule": True,
+            "depth_warm_start_epoch": 500,
+            "depth_warm_ramp_epochs": 300,
+            "ws_every": 4,
+            "ws_max_batches": 80,
+            "ws_max_batches_stageA": 30,
+            "ws_every_late": 12,
+            "ws_max_batches_late": 8,
+            "run_id_suffix": "_prj4_anchor_ws_tight_beta010",
+        },
+        "r4_anchor_ws_tight_beta015": {
+            "aniso_backend": "skeleton_graph",
+            "aniso_use_tensor_strength": True,
+            "agpe_long_edges": True,
+            "iterative_R": True,
+            "agpe_cache_graph": True,
+            "agpe_refine_graph": True,
+            "agpe_rebuild_every": 50,
+            "use_detail_branch": True,
+            "detail_gain": 0.15,
+            "lambda_amp_anchor": 0.05,
+            "use_boundary_weight": True,
+            "boundary_weight_width": 1,
+            "boundary_weight_beta": 0.15,
+            "use_boundary_warm_schedule": True,
+            "boundary_beta_start": 0.0,
+            "boundary_beta_end": 0.15,
+            "boundary_warm_start_epoch": 500,
+            "boundary_warm_ramp_epochs": 300,
+            "lambda_depth_grad": 0.005,
+            "lambda_depth_hf": 0.001,
+            "use_depth_warm_schedule": True,
+            "depth_warm_start_epoch": 500,
+            "depth_warm_ramp_epochs": 300,
+            "ws_every": 4,
+            "ws_max_batches": 80,
+            "ws_max_batches_stageA": 30,
+            "ws_every_late": 12,
+            "ws_max_batches_late": 8,
+            "run_id_suffix": "_prj4_anchor_ws_tight_beta015",
+        },
+        "r4_anchor_ws_tight_beta020": {
+            "aniso_backend": "skeleton_graph",
+            "aniso_use_tensor_strength": True,
+            "agpe_long_edges": True,
+            "iterative_R": True,
+            "agpe_cache_graph": True,
+            "agpe_refine_graph": True,
+            "agpe_rebuild_every": 50,
+            "use_detail_branch": True,
+            "detail_gain": 0.15,
+            "lambda_amp_anchor": 0.05,
+            "use_boundary_weight": True,
+            "boundary_weight_width": 1,
+            "boundary_weight_beta": 0.20,
+            "use_boundary_warm_schedule": True,
+            "boundary_beta_start": 0.0,
+            "boundary_beta_end": 0.20,
+            "boundary_warm_start_epoch": 500,
+            "boundary_warm_ramp_epochs": 300,
+            "lambda_depth_grad": 0.005,
+            "lambda_depth_hf": 0.001,
+            "use_depth_warm_schedule": True,
+            "depth_warm_start_epoch": 500,
+            "depth_warm_ramp_epochs": 300,
+            "ws_every": 4,
+            "ws_max_batches": 80,
+            "ws_max_batches_stageA": 30,
+            "ws_every_late": 12,
+            "ws_max_batches_late": 8,
+            "run_id_suffix": "_prj4_anchor_ws_tight_beta020",
+        },
+    }
+)
+
+ROUND4_REFERENCE_CASE: str = "r4_anchor_depth005001_late_amp005"
+
+# Formal comparison matrix: keep WS-tight as mandatory baseline and variants.
+ROUND4_DEFAULT_CASES: List[str] = [
+    "r4_anchor_ws_tight_nobw",
+    "r4_anchor_ws_tight_beta010",
+    "r4_anchor_ws_tight_beta015",
+    "r4_anchor_ws_tight_beta020",
+]
+
+
 def _save_metrics_excel(xlsx_path: Path, rows: list[dict], sheet_name: str = "metrics") -> None:
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
@@ -619,9 +779,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cases",
         nargs="+",
-        default=ROUND3_DEFAULT_CASES,
+        default=ROUND4_DEFAULT_CASES,
         choices=sorted(CASE_PRESETS.keys()),
-        help="Sweep cases to run (default: round-3 conservative dg=0.15 matrix).",
+        help="Sweep cases to run (default: round-4 formal ws_tight matrix).",
     )
     parser.add_argument("--mode", default="both", choices=["train", "test", "both"])
     parser.add_argument("--epochs", type=int, default=None)
