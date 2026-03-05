@@ -12,6 +12,10 @@ from setting import TCN1D_test_p, TCN1D_train_p
 from test_3D import test
 from train_multitask import train
 
+# Secondary gate metric for projection/ghosting on representative depth slices.
+SHADOW_DEPTH_SLICES = (40, 100, 160)
+SHADOW_ABS_ERR_THRESH = 0.80
+
 
 CASE_PRESETS: Dict[str, Dict[str, object]] = {
     # Baseline: keep detail branch, disable boundary/depth constraints.
@@ -587,6 +591,120 @@ ROUND4_DEFAULT_CASES: List[str] = [
     "r4_anchor_ws_tight_beta020",
 ]
 
+# -----------------------------
+# Round-5 minimal matrix (3 cases)
+# - fix SOTA baseline at ws_tight_nobw
+# - keep only beta020 candidate
+# - add AI-only boundary weighting control
+# - make cache effective: agpe_rebuild_every > R_update_every (200 > 50)
+# -----------------------------
+CASE_PRESETS.update(
+    {
+        "r5_anchor_ws_tight_nobw_cache200": {
+            "aniso_backend": "skeleton_graph",
+            "aniso_use_tensor_strength": True,
+            "agpe_long_edges": True,
+            "iterative_R": True,
+            "agpe_cache_graph": True,
+            "agpe_refine_graph": True,
+            "agpe_rebuild_every": 200,
+            "R_update_every": 50,
+            "use_detail_branch": True,
+            "detail_gain": 0.15,
+            "lambda_amp_anchor": 0.05,
+            "use_boundary_weight": False,
+            "lambda_depth_grad": 0.005,
+            "lambda_depth_hf": 0.001,
+            "use_depth_warm_schedule": True,
+            "depth_warm_start_epoch": 500,
+            "depth_warm_ramp_epochs": 300,
+            "use_boundary_warm_schedule": False,
+            "ws_every": 4,
+            "ws_max_batches": 80,
+            "ws_max_batches_stageA": 30,
+            "ws_every_late": 12,
+            "ws_max_batches_late": 8,
+            "run_id_suffix": "_prj5_anchor_ws_tight_nobw_cache200",
+        },
+        "r5_anchor_ws_tight_beta020_aidetail_cache200": {
+            "aniso_backend": "skeleton_graph",
+            "aniso_use_tensor_strength": True,
+            "agpe_long_edges": True,
+            "iterative_R": True,
+            "agpe_cache_graph": True,
+            "agpe_refine_graph": True,
+            "agpe_rebuild_every": 200,
+            "R_update_every": 50,
+            "use_detail_branch": True,
+            "detail_gain": 0.15,
+            "lambda_amp_anchor": 0.05,
+            "use_boundary_weight": True,
+            "boundary_weight_width": 1,
+            "boundary_weight_beta": 0.20,
+            "use_boundary_warm_schedule": True,
+            "boundary_beta_start": 0.0,
+            "boundary_beta_end": 0.20,
+            "boundary_warm_start_epoch": 500,
+            "boundary_warm_ramp_epochs": 300,
+            "boundary_weight_apply_ai": True,
+            "boundary_weight_apply_detail": True,
+            "boundary_weight_apply_facies": False,
+            "lambda_depth_grad": 0.005,
+            "lambda_depth_hf": 0.001,
+            "use_depth_warm_schedule": True,
+            "depth_warm_start_epoch": 500,
+            "depth_warm_ramp_epochs": 300,
+            "ws_every": 4,
+            "ws_max_batches": 80,
+            "ws_max_batches_stageA": 30,
+            "ws_every_late": 12,
+            "ws_max_batches_late": 8,
+            "run_id_suffix": "_prj5_anchor_ws_tight_beta020_aidetail_cache200",
+        },
+        "r5_anchor_ws_tight_beta020_aionly_cache200": {
+            "aniso_backend": "skeleton_graph",
+            "aniso_use_tensor_strength": True,
+            "agpe_long_edges": True,
+            "iterative_R": True,
+            "agpe_cache_graph": True,
+            "agpe_refine_graph": True,
+            "agpe_rebuild_every": 200,
+            "R_update_every": 50,
+            "use_detail_branch": True,
+            "detail_gain": 0.15,
+            "lambda_amp_anchor": 0.05,
+            "use_boundary_weight": True,
+            "boundary_weight_width": 1,
+            "boundary_weight_beta": 0.20,
+            "use_boundary_warm_schedule": True,
+            "boundary_beta_start": 0.0,
+            "boundary_beta_end": 0.20,
+            "boundary_warm_start_epoch": 500,
+            "boundary_warm_ramp_epochs": 300,
+            "boundary_weight_apply_ai": True,
+            "boundary_weight_apply_detail": False,
+            "boundary_weight_apply_facies": False,
+            "lambda_depth_grad": 0.005,
+            "lambda_depth_hf": 0.001,
+            "use_depth_warm_schedule": True,
+            "depth_warm_start_epoch": 500,
+            "depth_warm_ramp_epochs": 300,
+            "ws_every": 4,
+            "ws_max_batches": 80,
+            "ws_max_batches_stageA": 30,
+            "ws_every_late": 12,
+            "ws_max_batches_late": 8,
+            "run_id_suffix": "_prj5_anchor_ws_tight_beta020_aionly_cache200",
+        },
+    }
+)
+
+ROUND5_DEFAULT_CASES: List[str] = [
+    "r5_anchor_ws_tight_nobw_cache200",
+    "r5_anchor_ws_tight_beta020_aidetail_cache200",
+    "r5_anchor_ws_tight_beta020_aionly_cache200",
+]
+
 
 def _save_metrics_excel(xlsx_path: Path, rows: list[dict], sheet_name: str = "metrics") -> None:
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
@@ -646,14 +764,24 @@ def _collect_health_metrics(case_dir: Path) -> dict:
     boot_files = sorted(case_dir.glob("*_pred_AI_bootstrap.npy"))
     if not pred_files or not true_files:
         return {}
-    pred = np.load(pred_files[0]).reshape(-1).astype(np.float64)
-    true = np.load(true_files[0]).reshape(-1).astype(np.float64)
+
+    pred_raw = np.load(pred_files[0])
+    true_raw = np.load(true_files[0])
+
+    pred_nh = pred_raw[:, 0, :] if (pred_raw.ndim == 3 and pred_raw.shape[1] == 1) else pred_raw
+    true_nh = true_raw[:, 0, :] if (true_raw.ndim == 3 and true_raw.shape[1] == 1) else true_raw
+    if pred_nh.ndim != 2 or true_nh.ndim != 2:
+        return {}
+
+    pred = pred_nh.reshape(-1).astype(np.float64)
+    true = true_nh.reshape(-1).astype(np.float64)
     out = {
         "pred_mean": float(pred.mean()),
         "pred_std": float(pred.std()),
         "pred_min": float(pred.min()),
         "pred_max": float(pred.max()),
     }
+
     if boot_files:
         boot = np.load(boot_files[0]).reshape(-1).astype(np.float64)
         r2_boot = float(r2_score(true, boot))
@@ -669,6 +797,29 @@ def _collect_health_metrics(case_dir: Path) -> dict:
                 "r2_final_minus_bootstrap": float(r2_final - r2_boot),
             }
         )
+
+    data_ai = Path("data") / "Stanford_VI" / "AI.npy"
+    if data_ai.is_file():
+        try:
+            ai_ref = np.load(data_ai, mmap_mode="r")
+            H, IL, XL = int(ai_ref.shape[0]), int(ai_ref.shape[1]), int(ai_ref.shape[2])
+            if (pred_nh.shape[0] == IL * XL) and (pred_nh.shape[1] == H):
+                pred_cube = pred_nh.T.reshape(H, IL, XL)
+                true_cube = true_nh.T.reshape(H, IL, XL)
+                valid_depths = [int(d) for d in SHADOW_DEPTH_SLICES if 0 <= int(d) < H]
+                shadow_vals: list[float] = []
+                for d in valid_depths:
+                    err = np.abs(pred_cube[d] - true_cube[d])
+                    ratio = float((err > float(SHADOW_ABS_ERR_THRESH)).mean())
+                    out[f"shadow_area_d{d}"] = ratio
+                    shadow_vals.append(ratio)
+                if shadow_vals:
+                    out["shadow_abs_err_thresh"] = float(SHADOW_ABS_ERR_THRESH)
+                    out["shadow_area_mean"] = float(np.mean(shadow_vals))
+                    out["shadow_area_max"] = float(np.max(shadow_vals))
+        except Exception:
+            pass
+
     return out
 
 
@@ -679,11 +830,19 @@ def _health_gate(row: dict) -> dict:
     gate_mean_ok = pred_mean <= 0.35
     gate_std_ok = 0.80 <= pred_std <= 1.15
     gate_gap_ok = r2_gap >= -0.01
+
+    shadow_area_mean = row.get("shadow_area_mean", None)
+    if shadow_area_mean is None:
+        gate_shadow_ok = True
+    else:
+        gate_shadow_ok = float(shadow_area_mean) <= 0.26
+
     return {
         "gate_pred_mean_ok": bool(gate_mean_ok),
         "gate_pred_std_ok": bool(gate_std_ok),
         "gate_bootstrap_gap_ok": bool(gate_gap_ok),
-        "gate_overall": bool(gate_mean_ok and gate_std_ok and gate_gap_ok),
+        "gate_shadow_area_ok": bool(gate_shadow_ok),
+        "gate_overall": bool(gate_mean_ok and gate_std_ok and gate_gap_ok and gate_shadow_ok),
     }
 
 
@@ -770,6 +929,46 @@ def run_cases(cases: List[str], mode: str, epochs_override: int | None) -> None:
                 _save_metrics_excel(case_dir / "test_metrics.xlsx", [summary_rows[-1]], sheet_name="test_metrics")
 
     if summary_rows:
+        baseline_row = None
+        for r in summary_rows:
+            if r.get("case") in ("r5_anchor_ws_tight_nobw_cache200", "r4_anchor_ws_tight_nobw"):
+                baseline_row = r
+                break
+        if baseline_row is None:
+            for r in summary_rows:
+                if "nobw" in str(r.get("case", "")):
+                    baseline_row = r
+                    break
+
+        if baseline_row is not None:
+            base_r2 = float(baseline_row.get("r2", np.nan))
+            base_shadow = baseline_row.get("shadow_area_mean", None)
+            base_shadow_val = float(base_shadow) if base_shadow is not None else np.nan
+            for r in summary_rows:
+                dr2 = float(r.get("r2", np.nan)) - base_r2
+                r["delta_r2_vs_nobw"] = dr2
+                if np.isfinite(base_shadow_val) and ("shadow_area_mean" in r):
+                    dshadow = float(r.get("shadow_area_mean", np.nan)) - base_shadow_val
+                    r["delta_shadow_area_vs_nobw"] = dshadow
+                    r2_shadow_ok = (dr2 >= 0.0) and (dshadow <= 0.0)
+                else:
+                    r["delta_shadow_area_vs_nobw"] = np.nan
+                    r2_shadow_ok = dr2 >= 0.0
+                is_baseline = r.get("case") == baseline_row.get("case")
+                r["gate_r2_shadow_ok"] = bool(is_baseline or r2_shadow_ok)
+                r["keep_for_formal"] = bool(is_baseline or r2_shadow_ok)
+        else:
+            for r in summary_rows:
+                r["delta_r2_vs_nobw"] = np.nan
+                r["delta_shadow_area_vs_nobw"] = np.nan
+                r["gate_r2_shadow_ok"] = False
+                r["keep_for_formal"] = False
+
+        for r in summary_rows:
+            cdir = run_root / str(r.get("case_dir", ""))
+            if cdir.is_dir():
+                _save_metrics_excel(cdir / "test_metrics.xlsx", [r], sheet_name="test_metrics")
+
         _save_metrics_excel(run_root / "projection_sweep_summary.xlsx", summary_rows, sheet_name="summary")
         print(f"[SAVE] summary -> {(run_root / 'projection_sweep_summary.xlsx').as_posix()}")
 
@@ -779,9 +978,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cases",
         nargs="+",
-        default=ROUND4_DEFAULT_CASES,
+        default=ROUND5_DEFAULT_CASES,
         choices=sorted(CASE_PRESETS.keys()),
-        help="Sweep cases to run (default: round-4 formal ws_tight matrix).",
+        help="Sweep cases to run (default: round-5 minimal 3-case matrix).",
     )
     parser.add_argument("--mode", default="both", choices=["train", "test", "both"])
     parser.add_argument("--epochs", type=int, default=None)
