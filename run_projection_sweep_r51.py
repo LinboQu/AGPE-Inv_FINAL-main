@@ -3,27 +3,24 @@
 import argparse
 import copy
 import glob
-import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 
 import run_projection_sweep as base
 
 
 RESULTS_ROOT = Path("results")
-CASE_NOBW = "r51_nobw_rb100"
-CASE_AIONLY = "r51_beta020_aionly_rb100"
 
-# Small-range ghost-suppression tuning on top of nobw_rb100.
-# Only two knobs are changed: aniso_closed_loop_conf_thresh, agpe_lift_sigma.
-MICRO_VARIANTS = [
-    # (case_name, conf_thresh, lift_sigma)
-    ("r51_nobw_rb100_cf070_ls22", 0.70, 2.2),
-    ("r51_nobw_rb100_cf060_ls20", 0.60, 2.0),
-    ("r51_nobw_rb100_cf070_ls20", 0.70, 2.0),
-]
+# Three-case confirmation set.
+CASE_BASE = "r51_nobw_rb100"
+CASE_BACKUP = "r51_nobw_rb100_cf058_ls22"      # conservative backup
+CASE_CANDIDATE = "r51_nobw_rb100_cf060_ls23"   # promoted formal candidate
+
+# Optional diagnostic branch (kept for backward compatibility).
+CASE_AIONLY = "r51_beta020_aionly_rb100"
 
 
 def _list_projection_dirs() -> List[Path]:
@@ -44,55 +41,52 @@ def _latest_new_run_root(before: List[Path]) -> Path:
 
 
 def _build_r51_cases() -> Dict[str, dict]:
-    """Register Round5.1 cases on top of run_projection_sweep presets."""
-    r51_cases: Dict[str, dict] = {}
+    """Register R51 cases on top of run_projection_sweep presets."""
+    cases: Dict[str, dict] = {}
 
-    def make_case(base_name: str, new_name: str, rebuild_every: int, suffix: str, *, aionly: bool = False) -> None:
-        cfg = copy.deepcopy(base.CASE_PRESETS[base_name])
-        cfg["agpe_rebuild_every"] = int(rebuild_every)
-        cfg["R_update_every"] = 50
-        cfg["run_id_suffix"] = f"{cfg['run_id_suffix']}{suffix}"
-        if aionly:
-            cfg["boundary_weight_apply_ai"] = True
-            cfg["boundary_weight_apply_detail"] = False
-            cfg["boundary_weight_apply_facies"] = False
-        base.CASE_PRESETS[new_name] = cfg
-        r51_cases[new_name] = cfg
+    # Baseline config (rb100) from current best stable line.
+    base_cfg = copy.deepcopy(base.CASE_PRESETS["r5_anchor_ws_tight_nobw_cache200"])
+    base_cfg["agpe_rebuild_every"] = 100
+    base_cfg["R_update_every"] = 50
+    base_cfg["run_id_suffix"] = f"{base_cfg['run_id_suffix']}_r51_rb100"
+    base.CASE_PRESETS[CASE_BASE] = base_cfg
+    cases[CASE_BASE] = base_cfg
 
-    # Formal baseline fixed as requested.
-    make_case(
-        "r5_anchor_ws_tight_nobw_cache200",
-        CASE_NOBW,
-        rebuild_every=100,
-        suffix="_r51_rb100",
-    )
+    # Backup: single-knob conf tweak only (lift fixed).
+    backup_cfg = copy.deepcopy(base_cfg)
+    backup_cfg["aniso_closed_loop_conf_thresh"] = 0.58
+    backup_cfg["agpe_lift_sigma"] = 2.2
+    backup_cfg["run_id_suffix"] = f"{backup_cfg['run_id_suffix']}_cf058_ls22"
+    base.CASE_PRESETS[CASE_BACKUP] = backup_cfg
+    cases[CASE_BACKUP] = backup_cfg
 
-    # Single diagnostic candidate, evaluated in the same run root with baseline.
-    make_case(
-        "r5_anchor_ws_tight_beta020_aionly_cache200",
-        CASE_AIONLY,
-        rebuild_every=100,
-        suffix="_r51_rb100",
-        aionly=True,
-    )
+    # Candidate: single-knob lift tweak only (conf fixed).
+    cand_cfg = copy.deepcopy(base_cfg)
+    cand_cfg["aniso_closed_loop_conf_thresh"] = 0.60
+    cand_cfg["agpe_lift_sigma"] = 2.3
+    cand_cfg["run_id_suffix"] = f"{cand_cfg['run_id_suffix']}_cf060_ls23"
+    base.CASE_PRESETS[CASE_CANDIDATE] = cand_cfg
+    cases[CASE_CANDIDATE] = cand_cfg
 
-    # Micro tuning variants from nobw baseline: only change conf_thresh + lift_sigma.
-    for name, conf_t, lift_s in MICRO_VARIANTS:
-        cfg = copy.deepcopy(base.CASE_PRESETS[CASE_NOBW])
-        cfg["aniso_closed_loop_conf_thresh"] = float(conf_t)
-        cfg["agpe_lift_sigma"] = float(lift_s)
-        cfg["run_id_suffix"] = f"{cfg['run_id_suffix']}_cf{int(conf_t * 100):03d}_ls{int(lift_s * 10):02d}"
-        base.CASE_PRESETS[name] = cfg
-        r51_cases[name] = cfg
+    # Diagnostic branch (not part of formal default).
+    aionly_cfg = copy.deepcopy(base.CASE_PRESETS["r5_anchor_ws_tight_beta020_aionly_cache200"])
+    aionly_cfg["agpe_rebuild_every"] = 100
+    aionly_cfg["R_update_every"] = 50
+    aionly_cfg["run_id_suffix"] = f"{aionly_cfg['run_id_suffix']}_r51_rb100"
+    aionly_cfg["boundary_weight_apply_ai"] = True
+    aionly_cfg["boundary_weight_apply_detail"] = False
+    aionly_cfg["boundary_weight_apply_facies"] = False
+    base.CASE_PRESETS[CASE_AIONLY] = aionly_cfg
+    cases[CASE_AIONLY] = aionly_cfg
 
-    return r51_cases
+    return cases
 
 
 def _parse_args(choices: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Round5.1 runner: compare nobw_rb100 vs beta020_aionly_rb100 in same run root, "
-            "then repeat selected winner 3 times. Also supports a micro sweep on conf_thresh/lift_sigma."
+            "R51 runner: 3-case confirmation (baseline + cf058 + cf060_ls23), "
+            "then choose formal line by R2 and shadow_area_mean and run repeats."
         )
     )
     parser.add_argument("--mode", default="both", choices=["train", "test", "both"])
@@ -101,10 +95,12 @@ def _parse_args(choices: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--suite",
         default="full",
-        choices=["full", "compare", "repeat_nobw", "repeat_aionly", "micro"],
+        choices=["full", "confirm3", "repeat_base", "repeat_candidate", "compare_aionly"],
         help=(
-            "full=compare+auto-pick+repeats; compare=only same-root comparison; "
-            "repeat_nobw/repeat_aionly=force selected repeats; micro=nobw small-range conf/lift tuning"
+            "full=confirm3 then auto-select and repeat; "
+            "confirm3=single 3-case confirmation only; "
+            "repeat_base/repeat_candidate=forced repeats; "
+            "compare_aionly=baseline vs aionly diagnostic"
         ),
     )
     parser.add_argument(
@@ -117,6 +113,12 @@ def _parse_args(choices: List[str]) -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _run_once(cases: List[str], mode: str, epochs: int) -> Path:
+    before = _list_projection_dirs()
+    base.run_cases(cases=cases, mode=mode, epochs_override=epochs)
+    return _latest_new_run_root(before)
+
+
 def _read_summary(run_root: Path) -> pd.DataFrame:
     xlsx = run_root / "projection_sweep_summary.xlsx"
     if not xlsx.is_file():
@@ -124,52 +126,90 @@ def _read_summary(run_root: Path) -> pd.DataFrame:
     return pd.read_excel(xlsx)
 
 
-def _pick_winner_from_compare(df: pd.DataFrame) -> tuple[str, dict]:
-    req = {CASE_NOBW, CASE_AIONLY}
-    has = set(df.get("case", pd.Series([], dtype=str)).astype(str).tolist())
-    if not req.issubset(has):
-        missing = sorted(list(req - has))
-        raise RuntimeError(f"Comparison summary missing case rows: {missing}")
+def _row(df: pd.DataFrame, case_name: str) -> pd.Series:
+    sub = df[df["case"] == case_name]
+    if len(sub) == 0:
+        raise RuntimeError(f"Missing case row in summary: {case_name}")
+    return sub.iloc[0]
 
-    nobw = df[df["case"] == CASE_NOBW].iloc[0]
-    aionly = df[df["case"] == CASE_AIONLY].iloc[0]
 
-    delta_r2 = aionly.get("delta_r2_vs_nobw", None)
-    delta_shadow = aionly.get("delta_shadow_area_vs_nobw", None)
+def _as_float(v) -> float:
+    if pd.isna(v):
+        return float("nan")
+    return float(v)
 
-    if delta_r2 is None or pd.isna(delta_r2):
-        delta_r2 = float(aionly["r2"]) - float(nobw["r2"])
-    else:
-        delta_r2 = float(delta_r2)
 
-    if delta_shadow is None or pd.isna(delta_shadow):
-        if ("shadow_area_mean" in df.columns) and pd.notna(aionly.get("shadow_area_mean", None)) and pd.notna(nobw.get("shadow_area_mean", None)):
-            delta_shadow = float(aionly["shadow_area_mean"]) - float(nobw["shadow_area_mean"])
-        else:
-            delta_shadow = float("nan")
-    else:
-        delta_shadow = float(delta_shadow)
+def _print_brief_table(df: pd.DataFrame) -> None:
+    cols = [
+        c
+        for c in [
+            "case",
+            "r2",
+            "pcc",
+            "shadow_area_d160",
+            "shadow_area_mean",
+            "delta_r2_vs_nobw",
+            "delta_shadow_area_vs_nobw",
+            "gate_r2_shadow_ok",
+            "keep_for_formal",
+        ]
+        if c in df.columns
+    ]
+    if cols:
+        print(df[cols].to_string(index=False))
 
-    shadow_ok = (not pd.isna(delta_shadow)) and (delta_shadow <= 0.0)
-    pass_rule = (delta_r2 >= 0.0) and shadow_ok
-    winner = CASE_AIONLY if pass_rule else CASE_NOBW
+
+def _confirm_three_cases(df: pd.DataFrame) -> Tuple[str, dict]:
+    base_r = _row(df, CASE_BASE)
+    backup_r = _row(df, CASE_BACKUP)
+    cand_r = _row(df, CASE_CANDIDATE)
+
+    base_r2 = _as_float(base_r.get("r2"))
+    backup_r2 = _as_float(backup_r.get("r2"))
+    cand_r2 = _as_float(cand_r.get("r2"))
+
+    base_shadow = _as_float(base_r.get("shadow_area_mean"))
+    backup_shadow = _as_float(backup_r.get("shadow_area_mean"))
+    cand_shadow = _as_float(cand_r.get("shadow_area_mean"))
+
+    # Formal replacement rule from user: candidate must keep leading in R2 and shadow_area_mean.
+    lead_r2 = cand_r2 >= max(base_r2, backup_r2)
+    lead_shadow = cand_shadow <= min(base_shadow, backup_shadow)
+    candidate_wins = bool(lead_r2 and lead_shadow)
+
+    selected = CASE_CANDIDATE if candidate_wins else CASE_BASE
 
     detail = {
-        "nobw_r2": float(nobw["r2"]),
-        "aionly_r2": float(aionly["r2"]),
-        "delta_r2_vs_nobw": delta_r2,
-        "nobw_shadow": float(nobw.get("shadow_area_mean", float("nan"))),
-        "aionly_shadow": float(aionly.get("shadow_area_mean", float("nan"))),
-        "delta_shadow_area_vs_nobw": delta_shadow,
-        "rule_pass": bool(pass_rule),
+        "base_r2": base_r2,
+        "backup_r2": backup_r2,
+        "candidate_r2": cand_r2,
+        "base_shadow_mean": base_shadow,
+        "backup_shadow_mean": backup_shadow,
+        "candidate_shadow_mean": cand_shadow,
+        "candidate_delta_r2_vs_base": cand_r2 - base_r2,
+        "candidate_delta_shadow_vs_base": cand_shadow - base_shadow,
+        "candidate_delta_r2_vs_backup": cand_r2 - backup_r2,
+        "candidate_delta_shadow_vs_backup": cand_shadow - backup_shadow,
+        # Focused d160 check for reporting (not hard gate).
+        "base_shadow_d160": _as_float(base_r.get("shadow_area_d160", np.nan)),
+        "backup_shadow_d160": _as_float(backup_r.get("shadow_area_d160", np.nan)),
+        "candidate_shadow_d160": _as_float(cand_r.get("shadow_area_d160", np.nan)),
+        "candidate_wins": candidate_wins,
     }
-    return winner, detail
+    return selected, detail
 
 
-def _run_once(cases: List[str], mode: str, epochs: int) -> Path:
-    before = _list_projection_dirs()
-    base.run_cases(cases=cases, mode=mode, epochs_override=epochs)
-    return _latest_new_run_root(before)
+def _run_confirm3(mode: str, epochs: int) -> Tuple[Path, str, dict]:
+    cases = [CASE_BASE, CASE_BACKUP, CASE_CANDIDATE]
+    print(f"[R51] confirm3 cases={cases} mode={mode} epochs={epochs}")
+    run_root = _run_once(cases=cases, mode=mode, epochs=epochs)
+    df = _read_summary(run_root)
+    _print_brief_table(df)
+    selected, detail = _confirm_three_cases(df)
+    print(f"[R51] confirm3 run root: {run_root.as_posix()}")
+    print(f"[R51] confirm3 detail: {detail}")
+    print(f"[R51] selected formal case: {selected}")
+    return run_root, selected, detail
 
 
 def _run_repeats(case_name: str, mode: str, epochs: int, repeat_runs: int) -> List[Path]:
@@ -188,8 +228,6 @@ def _print_repeat_summary(roots: List[Path], case_name: str) -> None:
             df = _read_summary(root)
         except Exception:
             continue
-        if "case" not in df.columns:
-            continue
         sub = df[df["case"] == case_name]
         if len(sub) == 0:
             continue
@@ -197,57 +235,39 @@ def _print_repeat_summary(roots: List[Path], case_name: str) -> None:
         rows.append(
             {
                 "run_root": root.name,
-                "r2": float(r.get("r2", float("nan"))),
-                "pcc": float(r.get("pcc", float("nan"))),
-                "shadow_area_mean": float(r.get("shadow_area_mean", float("nan"))),
-                "pred_mean": float(r.get("pred_mean", float("nan"))),
-                "pred_std": float(r.get("pred_std", float("nan"))),
+                "r2": _as_float(r.get("r2", np.nan)),
+                "pcc": _as_float(r.get("pcc", np.nan)),
+                "shadow_area_d160": _as_float(r.get("shadow_area_d160", np.nan)),
+                "shadow_area_mean": _as_float(r.get("shadow_area_mean", np.nan)),
+                "pred_mean": _as_float(r.get("pred_mean", np.nan)),
+                "pred_std": _as_float(r.get("pred_std", np.nan)),
             }
         )
 
     if not rows:
-        print("[R51] repeat summary unavailable (no readable summary rows).")
+        print("[R51] repeat summary unavailable.")
         return
 
     df = pd.DataFrame(rows)
     print("[R51] repeat metrics:")
     print(df.to_string(index=False))
-    stats = df[["r2", "pcc", "shadow_area_mean", "pred_mean", "pred_std"]].agg(["mean", "std"])
+    stats = df[["r2", "pcc", "shadow_area_d160", "shadow_area_mean", "pred_mean", "pred_std"]].agg(["mean", "std"])
     print("[R51] repeat mean/std:")
     print(stats.to_string())
 
 
-def _run_micro_tuning(mode: str, epochs: int) -> Path:
-    cases = [CASE_NOBW] + [name for name, _, _ in MICRO_VARIANTS]
-    print(f"[R51][MICRO] running cases={cases} mode={mode} epochs={epochs}")
+def _run_compare_aionly(mode: str, epochs: int) -> Path:
+    cases = [CASE_BASE, CASE_AIONLY]
+    print(f"[R51] compare_aionly cases={cases} mode={mode} epochs={epochs}")
     run_root = _run_once(cases=cases, mode=mode, epochs=epochs)
     df = _read_summary(run_root)
-    cols = [
-        c
-        for c in [
-            "case",
-            "r2",
-            "pcc",
-            "shadow_area_mean",
-            "pred_mean",
-            "pred_std",
-            "delta_r2_vs_nobw",
-            "delta_shadow_area_vs_nobw",
-            "gate_r2_shadow_ok",
-            "keep_for_formal",
-        ]
-        if c in df.columns
-    ]
-    if cols:
-        print("[R51][MICRO] summary:")
-        print(df[cols].to_string(index=False))
+    _print_brief_table(df)
     return run_root
 
 
 def main() -> None:
     r51_cases = _build_r51_cases()
-    all_choices = sorted(r51_cases.keys())
-    args = _parse_args(all_choices)
+    args = _parse_args(sorted(r51_cases.keys()))
 
     if args.cases:
         print(f"[R51] manual cases: {args.cases}")
@@ -255,46 +275,35 @@ def main() -> None:
         print(f"[R51] manual run root: {run_root.as_posix()}")
         return
 
-    if args.suite == "micro":
-        run_root = _run_micro_tuning(mode=args.mode, epochs=int(args.epochs))
-        print(f"[R51][MICRO] run root: {run_root.as_posix()}")
+    if args.suite == "confirm3":
+        _run_confirm3(mode=args.mode, epochs=int(args.epochs))
         return
 
-    if args.suite == "compare":
-        run_root = _run_once(cases=[CASE_NOBW, CASE_AIONLY], mode=args.mode, epochs=int(args.epochs))
-        df = _read_summary(run_root)
-        winner, detail = _pick_winner_from_compare(df)
-        print(f"[R51] compare run root: {run_root.as_posix()}")
-        print(f"[R51] compare detail: {detail}")
-        print(f"[R51] selected winner: {winner}")
+    if args.suite == "repeat_base":
+        roots = _run_repeats(CASE_BASE, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
+        _print_repeat_summary(roots, CASE_BASE)
         return
 
-    if args.suite in ("repeat_nobw", "repeat_aionly"):
-        winner = CASE_NOBW if args.suite == "repeat_nobw" else CASE_AIONLY
-        roots = _run_repeats(case_name=winner, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
-        _print_repeat_summary(roots, winner)
+    if args.suite == "repeat_candidate":
+        roots = _run_repeats(CASE_CANDIDATE, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
+        _print_repeat_summary(roots, CASE_CANDIDATE)
         return
 
-    # full: compare first, then auto-select, then repeat 3 runs.
-    compare_root = _run_once(cases=[CASE_NOBW, CASE_AIONLY], mode=args.mode, epochs=int(args.epochs))
-    compare_df = _read_summary(compare_root)
-    winner, detail = _pick_winner_from_compare(compare_df)
+    if args.suite == "compare_aionly":
+        run_root = _run_compare_aionly(mode=args.mode, epochs=int(args.epochs))
+        print(f"[R51] compare_aionly run root: {run_root.as_posix()}")
+        return
 
-    print(f"[R51] compare run root: {compare_root.as_posix()}")
-    print(f"[R51] compare detail: {detail}")
-    print(f"[R51] selected winner: {winner}")
-    if winner == CASE_NOBW:
-        print("[R51] aionly fails rule (delta_r2>=0 and delta_shadow<=0), archived as diagnostic.")
+    # full: do 3-case confirmation first, then repeat selected formal line.
+    _, selected, detail = _run_confirm3(mode=args.mode, epochs=int(args.epochs))
+    if selected == CASE_CANDIDATE:
+        print("[R51] candidate confirmed. Formal baseline replaced by r51_nobw_rb100_cf060_ls23.")
     else:
-        print("[R51] aionly passes rule, upgrade to formal candidate.")
+        print("[R51] candidate not consistently leading. Keep baseline r51_nobw_rb100.")
+    print(f"[R51] decision detail: {detail}")
 
-    repeat_roots = _run_repeats(
-        case_name=winner,
-        mode=args.mode,
-        epochs=int(args.epochs),
-        repeat_runs=int(args.repeat_runs),
-    )
-    _print_repeat_summary(repeat_roots, winner)
+    roots = _run_repeats(selected, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
+    _print_repeat_summary(roots, selected)
 
 
 if __name__ == "__main__":
