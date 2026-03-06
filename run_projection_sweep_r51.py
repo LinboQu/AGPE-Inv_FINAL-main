@@ -14,10 +14,13 @@ import run_projection_sweep as base
 
 RESULTS_ROOT = Path("results")
 
-# Three-case confirmation set.
-CASE_BASE = "r51_nobw_rb100"
-CASE_BACKUP = "r51_nobw_rb100_cf058_ls22"      # conservative backup
-CASE_CANDIDATE = "r51_nobw_rb100_cf060_ls23"   # promoted formal candidate
+# Three-case micro-tuning set:
+# - lock formal baseline at cf060_ls23
+# - single-knob A: agpe_long_weight
+# - single-knob B: agpe_well_soft_alpha
+CASE_BASE = "r51_nobw_rb100_cf060_ls23"
+CASE_MICRO_LONGW = "r51_nobw_rb100_cf060_ls23_lw025"
+CASE_MICRO_WELL = "r51_nobw_rb100_cf060_ls23_ws012"
 
 # Optional diagnostic branch (kept for backward compatibility).
 CASE_AIONLY = "r51_beta020_aionly_rb100"
@@ -44,29 +47,29 @@ def _build_r51_cases() -> Dict[str, dict]:
     """Register R51 cases on top of run_projection_sweep presets."""
     cases: Dict[str, dict] = {}
 
-    # Baseline config (rb100) from current best stable line.
+    # Locked formal baseline from current best stable line.
     base_cfg = copy.deepcopy(base.CASE_PRESETS["r5_anchor_ws_tight_nobw_cache200"])
     base_cfg["agpe_rebuild_every"] = 100
     base_cfg["R_update_every"] = 50
-    base_cfg["run_id_suffix"] = f"{base_cfg['run_id_suffix']}_r51_rb100"
+    base_cfg["aniso_closed_loop_conf_thresh"] = 0.60
+    base_cfg["agpe_lift_sigma"] = 2.3
+    base_cfg["run_id_suffix"] = f"{base_cfg['run_id_suffix']}_r51_rb100_cf060_ls23"
     base.CASE_PRESETS[CASE_BASE] = base_cfg
     cases[CASE_BASE] = base_cfg
 
-    # Backup: single-knob conf tweak only (lift fixed).
-    backup_cfg = copy.deepcopy(base_cfg)
-    backup_cfg["aniso_closed_loop_conf_thresh"] = 0.58
-    backup_cfg["agpe_lift_sigma"] = 2.2
-    backup_cfg["run_id_suffix"] = f"{backup_cfg['run_id_suffix']}_cf058_ls22"
-    base.CASE_PRESETS[CASE_BACKUP] = backup_cfg
-    cases[CASE_BACKUP] = backup_cfg
+    # Single knob A: suppress long-edge spreading only.
+    longw_cfg = copy.deepcopy(base_cfg)
+    longw_cfg["agpe_long_weight"] = 0.25
+    longw_cfg["run_id_suffix"] = f"{longw_cfg['run_id_suffix']}_lw025"
+    base.CASE_PRESETS[CASE_MICRO_LONGW] = longw_cfg
+    cases[CASE_MICRO_LONGW] = longw_cfg
 
-    # Candidate: single-knob lift tweak only (conf fixed).
-    cand_cfg = copy.deepcopy(base_cfg)
-    cand_cfg["aniso_closed_loop_conf_thresh"] = 0.60
-    cand_cfg["agpe_lift_sigma"] = 2.3
-    cand_cfg["run_id_suffix"] = f"{cand_cfg['run_id_suffix']}_cf060_ls23"
-    base.CASE_PRESETS[CASE_CANDIDATE] = cand_cfg
-    cases[CASE_CANDIDATE] = cand_cfg
+    # Single knob B: soften well hard injection only.
+    well_cfg = copy.deepcopy(base_cfg)
+    well_cfg["agpe_well_soft_alpha"] = 0.12
+    well_cfg["run_id_suffix"] = f"{well_cfg['run_id_suffix']}_ws012"
+    base.CASE_PRESETS[CASE_MICRO_WELL] = well_cfg
+    cases[CASE_MICRO_WELL] = well_cfg
 
     # Diagnostic branch (not part of formal default).
     aionly_cfg = copy.deepcopy(base.CASE_PRESETS["r5_anchor_ws_tight_beta020_aionly_cache200"])
@@ -85,8 +88,9 @@ def _build_r51_cases() -> Dict[str, dict]:
 def _parse_args(choices: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "R51 runner: 3-case confirmation (baseline + cf058 + cf060_ls23), "
-            "then choose formal line by R2 and shadow_area_mean and run repeats."
+            "R51 runner: locked baseline + two single-knob micro cases "
+            "(agpe_long_weight / agpe_well_soft_alpha), then auto-select by "
+            "R2 + shadow_area_mean + shadow_area_d160 and run repeats."
         )
     )
     parser.add_argument("--mode", default="both", choices=["train", "test", "both"])
@@ -95,11 +99,19 @@ def _parse_args(choices: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--suite",
         default="full",
-        choices=["full", "confirm3", "repeat_base", "repeat_candidate", "compare_aionly"],
+        choices=[
+            "full",
+            "confirm3",
+            "repeat_base",
+            "repeat_longw",
+            "repeat_well",
+            "repeat_candidate",
+            "compare_aionly",
+        ],
         help=(
             "full=confirm3 then auto-select and repeat; "
             "confirm3=single 3-case confirmation only; "
-            "repeat_base/repeat_candidate=forced repeats; "
+            "repeat_base/repeat_longw/repeat_well=forced repeats; "
             "compare_aionly=baseline vs aionly diagnostic"
         ),
     )
@@ -150,6 +162,7 @@ def _print_brief_table(df: pd.DataFrame) -> None:
             "shadow_area_mean",
             "delta_r2_vs_nobw",
             "delta_shadow_area_vs_nobw",
+            "delta_shadow_area_d160_vs_nobw",
             "gate_r2_shadow_ok",
             "keep_for_formal",
         ]
@@ -161,46 +174,56 @@ def _print_brief_table(df: pd.DataFrame) -> None:
 
 def _confirm_three_cases(df: pd.DataFrame) -> Tuple[str, dict]:
     base_r = _row(df, CASE_BASE)
-    backup_r = _row(df, CASE_BACKUP)
-    cand_r = _row(df, CASE_CANDIDATE)
-
     base_r2 = _as_float(base_r.get("r2"))
-    backup_r2 = _as_float(backup_r.get("r2"))
-    cand_r2 = _as_float(cand_r.get("r2"))
-
     base_shadow = _as_float(base_r.get("shadow_area_mean"))
-    backup_shadow = _as_float(backup_r.get("shadow_area_mean"))
-    cand_shadow = _as_float(cand_r.get("shadow_area_mean"))
+    base_d160 = _as_float(base_r.get("shadow_area_d160", np.nan))
 
-    # Formal replacement rule from user: candidate must keep leading in R2 and shadow_area_mean.
-    lead_r2 = cand_r2 >= max(base_r2, backup_r2)
-    lead_shadow = cand_shadow <= min(base_shadow, backup_shadow)
-    candidate_wins = bool(lead_r2 and lead_shadow)
+    candidates = [CASE_MICRO_LONGW, CASE_MICRO_WELL]
+    trial_details = {}
+    passed = []
+    for case_name in candidates:
+        r = _row(df, case_name)
+        r2 = _as_float(r.get("r2"))
+        shadow = _as_float(r.get("shadow_area_mean"))
+        d160 = _as_float(r.get("shadow_area_d160", np.nan))
+        delta_r2 = r2 - base_r2
+        delta_shadow = shadow - base_shadow
+        delta_d160 = d160 - base_d160
+        pass_gate = bool((delta_r2 >= 0.0) and (delta_shadow <= 0.0) and (delta_d160 <= 0.0))
+        trial_details[case_name] = {
+            "r2": r2,
+            "shadow_area_mean": shadow,
+            "shadow_area_d160": d160,
+            "delta_r2_vs_base": delta_r2,
+            "delta_shadow_vs_base": delta_shadow,
+            "delta_d160_vs_base": delta_d160,
+            "pass_gate": pass_gate,
+        }
+        if pass_gate:
+            passed.append((case_name, r2, shadow, d160))
 
-    selected = CASE_CANDIDATE if candidate_wins else CASE_BASE
+    # tie-break: higher r2 first, then lower shadow mean, then lower d160
+    if passed:
+        passed.sort(key=lambda x: (-x[1], x[2], x[3]))
+        selected = passed[0][0]
+    else:
+        selected = CASE_BASE
 
     detail = {
-        "base_r2": base_r2,
-        "backup_r2": backup_r2,
-        "candidate_r2": cand_r2,
-        "base_shadow_mean": base_shadow,
-        "backup_shadow_mean": backup_shadow,
-        "candidate_shadow_mean": cand_shadow,
-        "candidate_delta_r2_vs_base": cand_r2 - base_r2,
-        "candidate_delta_shadow_vs_base": cand_shadow - base_shadow,
-        "candidate_delta_r2_vs_backup": cand_r2 - backup_r2,
-        "candidate_delta_shadow_vs_backup": cand_shadow - backup_shadow,
-        # Focused d160 check for reporting (not hard gate).
-        "base_shadow_d160": _as_float(base_r.get("shadow_area_d160", np.nan)),
-        "backup_shadow_d160": _as_float(backup_r.get("shadow_area_d160", np.nan)),
-        "candidate_shadow_d160": _as_float(cand_r.get("shadow_area_d160", np.nan)),
-        "candidate_wins": candidate_wins,
+        "base": {
+            "r2": base_r2,
+            "shadow_area_mean": base_shadow,
+            "shadow_area_d160": base_d160,
+        },
+        "trials": trial_details,
+        "selected": selected,
+        "any_pass_gate": bool(len(passed) > 0),
     }
     return selected, detail
 
 
 def _run_confirm3(mode: str, epochs: int) -> Tuple[Path, str, dict]:
-    cases = [CASE_BASE, CASE_BACKUP, CASE_CANDIDATE]
+    cases = [CASE_BASE, CASE_MICRO_LONGW, CASE_MICRO_WELL]
     print(f"[R51] confirm3 cases={cases} mode={mode} epochs={epochs}")
     run_root = _run_once(cases=cases, mode=mode, epochs=epochs)
     df = _read_summary(run_root)
@@ -284,9 +307,14 @@ def main() -> None:
         _print_repeat_summary(roots, CASE_BASE)
         return
 
-    if args.suite == "repeat_candidate":
-        roots = _run_repeats(CASE_CANDIDATE, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
-        _print_repeat_summary(roots, CASE_CANDIDATE)
+    if args.suite in ("repeat_longw", "repeat_candidate"):
+        roots = _run_repeats(CASE_MICRO_LONGW, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
+        _print_repeat_summary(roots, CASE_MICRO_LONGW)
+        return
+
+    if args.suite == "repeat_well":
+        roots = _run_repeats(CASE_MICRO_WELL, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
+        _print_repeat_summary(roots, CASE_MICRO_WELL)
         return
 
     if args.suite == "compare_aionly":
@@ -296,10 +324,10 @@ def main() -> None:
 
     # full: do 3-case confirmation first, then repeat selected formal line.
     _, selected, detail = _run_confirm3(mode=args.mode, epochs=int(args.epochs))
-    if selected == CASE_CANDIDATE:
-        print("[R51] candidate confirmed. Formal baseline replaced by r51_nobw_rb100_cf060_ls23.")
+    if selected != CASE_BASE:
+        print(f"[R51] micro-case confirmed. Formal baseline upgraded to {selected}.")
     else:
-        print("[R51] candidate not consistently leading. Keep baseline r51_nobw_rb100.")
+        print(f"[R51] no micro-case passed hard gate. Keep baseline {CASE_BASE}.")
     print(f"[R51] decision detail: {detail}")
 
     roots = _run_repeats(selected, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
