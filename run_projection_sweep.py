@@ -8,9 +8,17 @@ import numpy as np
 from openpyxl import Workbook
 from sklearn.metrics import r2_score
 
-from setting import TCN1D_test_p, TCN1D_train_p
+from setting import (
+    TEST_EXPERT_OVERRIDES,
+    TEST_PROFILE,
+    TEST_USER_P,
+    TRAIN_EXPERT_OVERRIDES,
+    TRAIN_PROFILE,
+    TRAIN_USER_P,
+)
 from test_3D import test
 from train_multitask import train
+from utils.config_resolver import build_test_config, build_train_config
 
 # Secondary gate metric for projection/ghosting on representative depth slices.
 SHADOW_DEPTH_SLICES = (40, 100, 160)
@@ -850,15 +858,24 @@ def build_case_configs(case_name: str, epochs_override: int | None) -> tuple[dic
     if case_name not in CASE_PRESETS:
         raise ValueError(f"Unknown case: {case_name}")
     preset = CASE_PRESETS[case_name]
-    train_cfg = copy.deepcopy(TCN1D_train_p)
-    test_cfg = copy.deepcopy(TCN1D_test_p)
-    train_cfg.update(preset)
-    test_cfg.update(preset)
-    run_id_base = f"{train_cfg['model_name']}_{train_cfg['Forward_model']}_{train_cfg['Facies_model']}"
-    test_cfg["run_id"] = run_id_base
-    test_cfg["model_name"] = f"{run_id_base}_s_uns"
+    train_expert = copy.deepcopy(TRAIN_EXPERT_OVERRIDES)
+    train_expert.update(preset)
+    train_cfg = build_train_config(
+        profile=TRAIN_PROFILE,
+        user_cfg=TRAIN_USER_P,
+        expert_overrides=train_expert,
+    )
     if epochs_override is not None:
         train_cfg["epochs"] = int(epochs_override)
+
+    test_expert = copy.deepcopy(TEST_EXPERT_OVERRIDES)
+    test_expert.update(preset)
+    test_cfg = build_test_config(
+        profile=TEST_PROFILE,
+        user_cfg=TEST_USER_P,
+        expert_overrides=test_expert,
+        train_cfg=train_cfg,
+    )
     return train_cfg, test_cfg
 
 

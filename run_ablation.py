@@ -6,9 +6,17 @@ from typing import Dict, List
 
 from openpyxl import Workbook
 
-from setting import TCN1D_test_p, TCN1D_train_p
+from setting import (
+    TEST_EXPERT_OVERRIDES,
+    TEST_PROFILE,
+    TEST_USER_P,
+    TRAIN_EXPERT_OVERRIDES,
+    TRAIN_PROFILE,
+    TRAIN_USER_P,
+)
 from train_multitask import train
 from test_3D import test
+from utils.config_resolver import build_test_config, build_train_config
 
 
 # Fair ablation common configuration (aligned with current best closed-loop line).
@@ -338,24 +346,32 @@ def build_case_configs(case_name: str, epochs_override: int | None) -> tuple[dic
         raise ValueError(f"Unknown case: {case_name}")
 
     preset = CASE_PRESETS[case_name]
-    train_cfg = copy.deepcopy(TCN1D_train_p)
-    test_cfg = copy.deepcopy(TCN1D_test_p)
+    train_expert = copy.deepcopy(TRAIN_EXPERT_OVERRIDES)
+    test_expert = copy.deepcopy(TEST_EXPERT_OVERRIDES)
 
     # Fairness guarantee: all ablation cases start from the same common baseline,
     # then apply case-specific differences only.
-    train_cfg.update(FAIR_ABLATION_COMMON)
-    test_cfg.update(FAIR_ABLATION_COMMON)
+    train_expert.update(FAIR_ABLATION_COMMON)
+    train_expert.update(preset)
 
-    train_cfg.update(preset)
-    test_cfg.update(preset)
+    test_expert.update(FAIR_ABLATION_COMMON)
+    test_expert.update(preset)
 
-    # Keep train/test run-id chain strictly aligned with current model combo.
-    run_id_base = f"{train_cfg['model_name']}_{train_cfg['Forward_model']}_{train_cfg['Facies_model']}"
-    test_cfg["run_id"] = run_id_base
-    test_cfg["model_name"] = f"{run_id_base}_s_uns"
+    train_cfg = build_train_config(
+        profile=TRAIN_PROFILE,
+        user_cfg=TRAIN_USER_P,
+        expert_overrides=train_expert,
+    )
 
     if epochs_override is not None:
         train_cfg["epochs"] = int(epochs_override)
+
+    test_cfg = build_test_config(
+        profile=TEST_PROFILE,
+        user_cfg=TEST_USER_P,
+        expert_overrides=test_expert,
+        train_cfg=train_cfg,
+    )
 
     return train_cfg, test_cfg
 

@@ -29,10 +29,11 @@ import torch
 from os.path import join
 from torch.utils.data import DataLoader
 
-from setting import *
+from setting import TCN1D_test_p, TCN1D_train_p, TEST_PROFILE, TRAIN_PROFILE
 from model.geomorphology_classification import Facies_model_class
 from utils.utils import standardize
 from utils.datasets import SeismicDataset1D
+from utils.config_resolver import resolve_test_config, resolve_train_config
 
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
@@ -523,8 +524,13 @@ def test(test_p: dict) -> dict:
     _ensure_dir("results")
     _ensure_dir("save_train_model")
 
-    # Read config.
-    cfg = {**TCN1D_train_p, **test_p}
+    base_train_cfg = resolve_train_config(TCN1D_train_p, default_profile=TRAIN_PROFILE)
+    cfg = resolve_test_config(
+        test_p,
+        train_cfg=base_train_cfg,
+        default_profile=TEST_PROFILE,
+        default_train_profile=TRAIN_PROFILE,
+    )
     run_id, model_name = _resolve_run_id_and_model_name(cfg)
     data_flag = cfg["data_flag"]
     no_wells = int(cfg.get("no_wells", 20))

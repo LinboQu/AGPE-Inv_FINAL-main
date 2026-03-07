@@ -39,9 +39,10 @@ from model.Transformer import TransformerModel
 from model.Forward import forward_model_0, forward_model_1, forward_model_2
 from model.geomorphology_classification import Facies_model_class
 
-from setting import *
+from setting import TCN1D_train_p, TRAIN_PROFILE
 from utils.utils import standardize
 from utils.datasets import SeismicDataset1D, SeismicDataset1D_SPF, SeismicDataset1D_SPF_WS
+from utils.config_resolver import resolve_train_config
 from utils.reliability_aniso import build_R_and_prior_from_cube
 
 
@@ -160,6 +161,8 @@ def get_data_SPF(no_wells=10, data_flag="Stanford_VI", get_F=0):
 # main train
 # -----------------------------
 def train(train_p: dict):
+    train_p = resolve_train_config(train_p, default_profile=TRAIN_PROFILE)
+
     # pick model classes
     model_name = train_p["model_name"]
     Forward_model = train_p["Forward_model"]
