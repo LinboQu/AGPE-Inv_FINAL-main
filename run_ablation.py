@@ -11,6 +11,52 @@ from train_multitask import train
 from test_3D import test
 
 
+# Fair ablation common configuration (aligned with current best closed-loop line).
+FAIR_ABLATION_COMMON: Dict[str, object] = {
+    "use_aniso_conditioning": True,
+    "aniso_train_protocol": "closed_loop",
+    "aniso_test_protocol": "closed_loop",
+    "aniso_backend": "skeleton_graph",
+    "aniso_use_tensor_strength": True,
+    "aniso_kappa": 4.0,
+    "agpe_long_edges": True,
+    "iterative_R": True,
+    "agpe_cache_graph": True,
+    "agpe_refine_graph": True,
+    "agpe_rebuild_every": 100,
+    "R_update_every": 50,
+    "aniso_closed_loop_conf_thresh": 0.60,
+    "agpe_lift_sigma": 2.3,
+    "agpe_long_weight": 0.35,
+    "agpe_well_soft_alpha": 0.20,
+    "agpe_well_seed_mode": "depth_gate",
+    "agpe_well_seed_min": 0.02,
+    "use_boundary_weight": False,
+    "lambda_depth_grad": 0.005,
+    "lambda_depth_hf": 0.001,
+    "use_depth_warm_schedule": True,
+    "depth_warm_start_epoch": 500,
+    "depth_warm_ramp_epochs": 300,
+    "use_boundary_warm_schedule": False,
+    "ws_every": 4,
+    "ws_max_batches": 80,
+    "ws_max_batches_stageA": 30,
+    "ws_every_late": 12,
+    "ws_max_batches_late": 8,
+    "use_detail_branch": True,
+    "detail_gain": 0.15,
+    "lambda_amp_anchor": 0.05,
+    "lambda_recon": 1.0,
+    "lambda_facies": 0.2,
+}
+
+
+def _fair_case(**overrides: object) -> Dict[str, object]:
+    out = copy.deepcopy(FAIR_ABLATION_COMMON)
+    out.update(overrides)
+    return out
+
+
 CASE_PRESETS: Dict[str, Dict[str, object]] = {
     # Control: legacy grid backend
     "grid": {
@@ -91,6 +137,33 @@ CASE_PRESETS: Dict[str, Dict[str, object]] = {
         "agpe_rebuild_every": 50,
         "run_id_suffix": "_skel_ref",
     },
+    # Best current line (locked): r51_nobw_rb100_cf060_ls23
+    "skel_ref_best_r51": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": True,
+        "iterative_R": True,
+        "agpe_cache_graph": True,
+        "agpe_refine_graph": True,
+        "agpe_rebuild_every": 100,
+        "R_update_every": 50,
+        "aniso_closed_loop_conf_thresh": 0.60,
+        "agpe_lift_sigma": 2.3,
+        "agpe_long_weight": 0.35,
+        "agpe_well_soft_alpha": 0.20,
+        "use_boundary_weight": False,
+        "lambda_depth_grad": 0.005,
+        "lambda_depth_hf": 0.001,
+        "use_depth_warm_schedule": True,
+        "depth_warm_start_epoch": 500,
+        "depth_warm_ramp_epochs": 300,
+        "ws_every": 4,
+        "ws_max_batches": 80,
+        "ws_max_batches_stageA": 30,
+        "ws_every_late": 12,
+        "ws_max_batches_late": 8,
+        "run_id_suffix": "_skel_ref_best_r51",
+    },
     # Isolation-A: Step-4 off (disable detail branch), keep everything else as skel_ref
     "skel_ref_nodetail": {
         "aniso_backend": "skeleton_graph",
@@ -132,6 +205,67 @@ CASE_PRESETS: Dict[str, Dict[str, object]] = {
         "lambda_depth_hf": 0.0,
         "run_id_suffix": "_skel_ref_nodetail_nobddep",
     },
+
+    # ---------------------------
+    # Fair comparison block (paper-ready)
+    # ---------------------------
+    # Baseline: no physics, no R (pure inversion only)
+    "fair_baseline_1d": _fair_case(
+        use_aniso_conditioning=False,
+        iterative_R=False,
+        lambda_recon=0.0,
+        lambda_facies=0.0,
+        stageA_lambda_recon_mult=0.0,
+        stageA_lambda_facies_mult=0.0,
+        use_detail_branch=False,
+        use_boundary_weight=False,
+        lambda_depth_grad=0.0,
+        lambda_depth_hf=0.0,
+        lambda_amp_anchor=0.0,
+        run_id_suffix="_fair_baseline_1d",
+    ),
+    # Physics: forward reconstruction only (still no R/FARP)
+    "fair_physics_only": _fair_case(
+        use_aniso_conditioning=False,
+        iterative_R=False,
+        lambda_recon=1.0,
+        lambda_facies=0.0,
+        stageA_lambda_facies_mult=0.0,
+        use_detail_branch=False,
+        use_boundary_weight=False,
+        lambda_depth_grad=0.0,
+        lambda_depth_hf=0.0,
+        lambda_amp_anchor=0.0,
+        run_id_suffix="_fair_physics_only",
+    ),
+    # FARP-Isotropic: isotropic reliability (phi=0 / no anisotropy)
+    "fair_farp_isotropic": _fair_case(
+        aniso_backend="grid",
+        aniso_use_tensor_strength=False,
+        aniso_kappa=0.0,
+        iterative_R=True,
+        run_id_suffix="_fair_farp_isotropic",
+    ),
+    # FARP-Non-iter: disable closed-loop iterative R update
+    "fair_farp_noniter": _fair_case(
+        iterative_R=False,
+        run_id_suffix="_fair_farp_noniter",
+    ),
+    # Proposed: full latest setting (current best line)
+    "fair_proposed": _fair_case(
+        run_id_suffix="_fair_proposed",
+    ),
+    # Deconfound-A: only rebuild frequency (100 -> 50), keep others as fair_proposed
+    "fair_proposed_rb50": _fair_case(
+        agpe_rebuild_every=50,
+        run_id_suffix="_fair_proposed_rb50",
+    ),
+    # Deconfound-B: only disable depth losses, keep rb100 and other settings unchanged
+    "fair_proposed_nobddep_rb100": _fair_case(
+        lambda_depth_grad=0.0,
+        lambda_depth_hf=0.0,
+        run_id_suffix="_fair_proposed_nobddep_rb100",
+    ),
 }
 
 
@@ -207,6 +341,11 @@ def build_case_configs(case_name: str, epochs_override: int | None) -> tuple[dic
     train_cfg = copy.deepcopy(TCN1D_train_p)
     test_cfg = copy.deepcopy(TCN1D_test_p)
 
+    # Fairness guarantee: all ablation cases start from the same common baseline,
+    # then apply case-specific differences only.
+    train_cfg.update(FAIR_ABLATION_COMMON)
+    test_cfg.update(FAIR_ABLATION_COMMON)
+
     train_cfg.update(preset)
     test_cfg.update(preset)
 
@@ -267,6 +406,10 @@ def run_cases(cases: List[str], mode: str, epochs_override: int | None) -> None:
                     "use_tensor_strength": bool(use_ts),
                     "aniso_train_protocol": str(train_cfg.get("aniso_train_protocol", "closed_loop")),
                     "aniso_test_protocol": str(test_cfg.get("aniso_test_protocol", "closed_loop")),
+                    "use_aniso_conditioning": bool(train_cfg.get("use_aniso_conditioning", False)),
+                    "aniso_kappa": float(train_cfg.get("aniso_kappa", 4.0)),
+                    "lambda_recon": float(train_cfg.get("lambda_recon", 0.0)),
+                    "lambda_facies": float(train_cfg.get("lambda_facies", 0.0)),
                     "agpe_long_edges": bool(train_cfg.get("agpe_long_edges", True)),
                     "agpe_refine_graph": bool(train_cfg.get("agpe_refine_graph", True)),
                     "agpe_cache_graph": bool(train_cfg.get("agpe_cache_graph", True)),
@@ -314,16 +457,13 @@ def parse_args() -> argparse.Namespace:
         "--cases",
         nargs="+",
         default=[
-            "grid",
-            "grid_static",
-            "glat",
-            "glat_static",
-            "glat_ts",
-            "skel_nolong",
-            "skel_nolong_iter",
-            "skel_long",
-            "skel_noref",
-            "skel_ref",
+            "fair_baseline_1d",
+            "fair_physics_only",
+            "fair_farp_isotropic",
+            "fair_farp_noniter",
+            "fair_proposed",
+            "fair_proposed_rb50",
+            "fair_proposed_nobddep_rb100",
         ],
         choices=sorted(CASE_PRESETS.keys()),
         help="Ablation cases to run (default: all).",

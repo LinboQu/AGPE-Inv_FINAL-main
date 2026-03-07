@@ -41,6 +41,9 @@ import cv2  # Keep cv2 import style to avoid from-import issues across environme
 # anisotropic reliability (FARP)
 from utils.reliability_aniso import build_R_and_prior_from_cube
 
+SHADOW_DEPTH_SLICES = (40, 100, 160)
+SHADOW_ABS_ERR_THRESH = 0.80
+
 def _infer_run_id_for_full_ckpt(model_name: str) -> str:
     """
     Your repo saves full_ckpt as:
@@ -446,6 +449,46 @@ def show_stanford_vi(
     plt.close()
 
 
+def _compute_shadow_area_metrics(
+    ai_pred_flat: np.ndarray,
+    ai_true_flat: np.ndarray,
+    meta: dict,
+    depth_slices: tuple[int, ...] = SHADOW_DEPTH_SLICES,
+    abs_err_thresh: float = SHADOW_ABS_ERR_THRESH,
+) -> dict:
+    """Compute per-depth shadow area ratios for Stanford-style 3D slices."""
+    out: dict = {}
+    try:
+        H = int(meta["H"])
+        IL = int(meta["inline"])
+        XL = int(meta["xline"])
+        reshape_order = str(meta.get("reshape_order", "C"))
+        if ai_pred_flat.ndim != 2 or ai_true_flat.ndim != 2:
+            return out
+        if (ai_pred_flat.shape[0] != IL * XL) or (ai_pred_flat.shape[1] != H):
+            return out
+
+        pred_3d = ai_pred_flat.reshape(IL, XL, H, order=reshape_order).transpose(2, 0, 1)
+        true_3d = ai_true_flat.reshape(IL, XL, H, order=reshape_order).transpose(2, 0, 1)
+
+        ratios: list[float] = []
+        for d in depth_slices:
+            d_int = int(d)
+            if 0 <= d_int < H:
+                err = np.abs(pred_3d[d_int] - true_3d[d_int])
+                ratio = float((err > float(abs_err_thresh)).mean())
+                out[f"shadow_area_d{d_int}"] = ratio
+                ratios.append(ratio)
+
+        if ratios:
+            out["shadow_abs_err_thresh"] = float(abs_err_thresh)
+            out["shadow_area_mean"] = float(np.mean(ratios))
+            out["shadow_area_max"] = float(np.max(ratios))
+    except Exception:
+        return out
+    return out
+
+
 def save_R_visualization(R_flat_torch: torch.Tensor, meta: dict, out_prefix: str, depth_slices=(40, 100, 160)):
     """
     Visualize and save R(x) 3D data and depth slices with consistent reshape order.
@@ -768,7 +811,22 @@ def test(test_p: dict) -> dict:
         "mae": float(mae),
         "medae": float(medae),
         "psnr": float(psnr),
+        "pred_mean": float(AI_pred_np.mean()),
+        "pred_std": float(AI_pred_np.std()),
+        "pred_min": float(AI_pred_np.min()),
+        "pred_max": float(AI_pred_np.max()),
     }
+
+    # Shadow-area metrics (same definition as projection sweep) for ablation comparability.
+    metrics.update(
+        _compute_shadow_area_metrics(
+            ai_pred_flat=AI_pred_np,
+            ai_true_flat=AI_act_np,
+            meta=meta,
+            depth_slices=SHADOW_DEPTH_SLICES,
+            abs_err_thresh=SHADOW_ABS_ERR_THRESH,
+        )
+    )
 
     # 12. Visualization
     if data_flag == "Stanford_VI":

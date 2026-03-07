@@ -14,13 +14,13 @@ import run_projection_sweep as base
 
 RESULTS_ROOT = Path("results")
 
-# Three-case micro-tuning set:
-# - lock formal baseline at cf060_ls23
-# - single-knob A: agpe_long_weight
-# - single-knob B: agpe_well_soft_alpha
+# 3-case deep-loss matrix:
+# - locked formal baseline
+# - trial A: deep-oriented depth loss (late + weak)
+# - trial B: trial A + AI-only boundary weighting (late + weak)
 CASE_BASE = "r51_nobw_rb100_cf060_ls23"
-CASE_MICRO_LONGW = "r51_nobw_rb100_cf060_ls23_lw025"
-CASE_MICRO_WELL = "r51_nobw_rb100_cf060_ls23_ws012"
+CASE_TRIAL_DEPTH = "r51_nobw_rb100_cf060_ls23_deepdep"
+CASE_TRIAL_AIBW = "r51_nobw_rb100_cf060_ls23_deepdep_aibw"
 
 # Optional diagnostic branch (kept for backward compatibility).
 CASE_AIONLY = "r51_beta020_aionly_rb100"
@@ -57,19 +57,33 @@ def _build_r51_cases() -> Dict[str, dict]:
     base.CASE_PRESETS[CASE_BASE] = base_cfg
     cases[CASE_BASE] = base_cfg
 
-    # Single knob A: suppress long-edge spreading only.
-    longw_cfg = copy.deepcopy(base_cfg)
-    longw_cfg["agpe_long_weight"] = 0.25
-    longw_cfg["run_id_suffix"] = f"{longw_cfg['run_id_suffix']}_lw025"
-    base.CASE_PRESETS[CASE_MICRO_LONGW] = longw_cfg
-    cases[CASE_MICRO_LONGW] = longw_cfg
+    # Trial A: deep-oriented depth regularization (late + weak), no boundary reweighting.
+    trial_depth = copy.deepcopy(base_cfg)
+    trial_depth["lambda_depth_grad"] = 0.008
+    trial_depth["lambda_depth_hf"] = 0.002
+    trial_depth["use_depth_warm_schedule"] = True
+    trial_depth["depth_warm_start_epoch"] = 650
+    trial_depth["depth_warm_ramp_epochs"] = 250
+    trial_depth["use_boundary_weight"] = False
+    trial_depth["run_id_suffix"] = f"{trial_depth['run_id_suffix']}_deepdep"
+    base.CASE_PRESETS[CASE_TRIAL_DEPTH] = trial_depth
+    cases[CASE_TRIAL_DEPTH] = trial_depth
 
-    # Single knob B: soften well hard injection only.
-    well_cfg = copy.deepcopy(base_cfg)
-    well_cfg["agpe_well_soft_alpha"] = 0.12
-    well_cfg["run_id_suffix"] = f"{well_cfg['run_id_suffix']}_ws012"
-    base.CASE_PRESETS[CASE_MICRO_WELL] = well_cfg
-    cases[CASE_MICRO_WELL] = well_cfg
+    # Trial B: Trial A + AI-only boundary weighting (late + weak), keep detail unweighted.
+    trial_aibw = copy.deepcopy(trial_depth)
+    trial_aibw["use_boundary_weight"] = True
+    trial_aibw["boundary_weight_width"] = 1
+    trial_aibw["boundary_weight_apply_ai"] = True
+    trial_aibw["boundary_weight_apply_detail"] = False
+    trial_aibw["boundary_weight_apply_facies"] = False
+    trial_aibw["use_boundary_warm_schedule"] = True
+    trial_aibw["boundary_beta_start"] = 0.0
+    trial_aibw["boundary_beta_end"] = 0.15
+    trial_aibw["boundary_warm_start_epoch"] = 650
+    trial_aibw["boundary_warm_ramp_epochs"] = 250
+    trial_aibw["run_id_suffix"] = f"{trial_aibw['run_id_suffix']}_aibw"
+    base.CASE_PRESETS[CASE_TRIAL_AIBW] = trial_aibw
+    cases[CASE_TRIAL_AIBW] = trial_aibw
 
     # Diagnostic branch (not part of formal default).
     aionly_cfg = copy.deepcopy(base.CASE_PRESETS["r5_anchor_ws_tight_beta020_aionly_cache200"])
@@ -88,9 +102,8 @@ def _build_r51_cases() -> Dict[str, dict]:
 def _parse_args(choices: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "R51 runner: locked baseline + two single-knob micro cases "
-            "(agpe_long_weight / agpe_well_soft_alpha), then auto-select by "
-            "R2 + shadow_area_mean + shadow_area_d160 and run repeats."
+            "R51 runner: deep-loss 3-case matrix (baseline + deepdep + deepdep_aibw), "
+            "auto-select by R2 + shadow_area_mean + shadow_area_d160 and run repeats."
         )
     )
     parser.add_argument("--mode", default="both", choices=["train", "test", "both"])
@@ -103,6 +116,8 @@ def _parse_args(choices: List[str]) -> argparse.Namespace:
             "full",
             "confirm3",
             "repeat_base",
+            "repeat_depth",
+            "repeat_aibw",
             "repeat_longw",
             "repeat_well",
             "repeat_candidate",
@@ -111,7 +126,8 @@ def _parse_args(choices: List[str]) -> argparse.Namespace:
         help=(
             "full=confirm3 then auto-select and repeat; "
             "confirm3=single 3-case confirmation only; "
-            "repeat_base/repeat_longw/repeat_well=forced repeats; "
+            "repeat_base/repeat_depth/repeat_aibw=forced repeats; "
+            "repeat_longw/repeat_well/repeat_candidate kept as backward aliases; "
             "compare_aionly=baseline vs aionly diagnostic"
         ),
     )
@@ -138,6 +154,12 @@ def _read_summary(run_root: Path) -> pd.DataFrame:
     return pd.read_excel(xlsx)
 
 
+def _as_float(v) -> float:
+    if pd.isna(v):
+        return float("nan")
+    return float(v)
+
+
 def _row(df: pd.DataFrame, case_name: str) -> pd.Series:
     sub = df[df["case"] == case_name]
     if len(sub) == 0:
@@ -145,10 +167,27 @@ def _row(df: pd.DataFrame, case_name: str) -> pd.Series:
     return sub.iloc[0]
 
 
-def _as_float(v) -> float:
-    if pd.isna(v):
-        return float("nan")
-    return float(v)
+def _attach_baseline_deltas(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach/overwrite baseline-referenced deltas for robust gating and reporting."""
+    out = df.copy()
+    if "case" not in out.columns:
+        return out
+    if CASE_BASE not in set(out["case"].astype(str).tolist()):
+        return out
+
+    base_r = _row(out, CASE_BASE)
+    base_r2 = _as_float(base_r.get("r2", np.nan))
+    base_shadow = _as_float(base_r.get("shadow_area_mean", np.nan))
+    base_d160 = _as_float(base_r.get("shadow_area_d160", np.nan))
+
+    if "r2" in out.columns:
+        out["delta_r2_vs_nobw"] = out["r2"].astype(float) - base_r2
+    if "shadow_area_mean" in out.columns:
+        out["delta_shadow_area_vs_nobw"] = out["shadow_area_mean"].astype(float) - base_shadow
+    if "shadow_area_d160" in out.columns:
+        out["delta_shadow_area_d160_vs_nobw"] = out["shadow_area_d160"].astype(float) - base_d160
+
+    return out
 
 
 def _print_brief_table(df: pd.DataFrame) -> None:
@@ -178,9 +217,10 @@ def _confirm_three_cases(df: pd.DataFrame) -> Tuple[str, dict]:
     base_shadow = _as_float(base_r.get("shadow_area_mean"))
     base_d160 = _as_float(base_r.get("shadow_area_d160", np.nan))
 
-    candidates = [CASE_MICRO_LONGW, CASE_MICRO_WELL]
+    candidates = [CASE_TRIAL_DEPTH, CASE_TRIAL_AIBW]
     trial_details = {}
     passed = []
+
     for case_name in candidates:
         r = _row(df, case_name)
         r2 = _as_float(r.get("r2"))
@@ -223,10 +263,10 @@ def _confirm_three_cases(df: pd.DataFrame) -> Tuple[str, dict]:
 
 
 def _run_confirm3(mode: str, epochs: int) -> Tuple[Path, str, dict]:
-    cases = [CASE_BASE, CASE_MICRO_LONGW, CASE_MICRO_WELL]
+    cases = [CASE_BASE, CASE_TRIAL_DEPTH, CASE_TRIAL_AIBW]
     print(f"[R51] confirm3 cases={cases} mode={mode} epochs={epochs}")
     run_root = _run_once(cases=cases, mode=mode, epochs=epochs)
-    df = _read_summary(run_root)
+    df = _attach_baseline_deltas(_read_summary(run_root))
     _print_brief_table(df)
     selected, detail = _confirm_three_cases(df)
     print(f"[R51] confirm3 run root: {run_root.as_posix()}")
@@ -248,7 +288,7 @@ def _print_repeat_summary(roots: List[Path], case_name: str) -> None:
     rows = []
     for root in roots:
         try:
-            df = _read_summary(root)
+            df = _attach_baseline_deltas(_read_summary(root))
         except Exception:
             continue
         sub = df[df["case"] == case_name]
@@ -264,6 +304,9 @@ def _print_repeat_summary(roots: List[Path], case_name: str) -> None:
                 "shadow_area_mean": _as_float(r.get("shadow_area_mean", np.nan)),
                 "pred_mean": _as_float(r.get("pred_mean", np.nan)),
                 "pred_std": _as_float(r.get("pred_std", np.nan)),
+                "delta_r2_vs_nobw": _as_float(r.get("delta_r2_vs_nobw", np.nan)),
+                "delta_shadow_area_vs_nobw": _as_float(r.get("delta_shadow_area_vs_nobw", np.nan)),
+                "delta_shadow_area_d160_vs_nobw": _as_float(r.get("delta_shadow_area_d160_vs_nobw", np.nan)),
             }
         )
 
@@ -274,7 +317,19 @@ def _print_repeat_summary(roots: List[Path], case_name: str) -> None:
     df = pd.DataFrame(rows)
     print("[R51] repeat metrics:")
     print(df.to_string(index=False))
-    stats = df[["r2", "pcc", "shadow_area_d160", "shadow_area_mean", "pred_mean", "pred_std"]].agg(["mean", "std"])
+    stats = df[
+        [
+            "r2",
+            "pcc",
+            "shadow_area_d160",
+            "shadow_area_mean",
+            "pred_mean",
+            "pred_std",
+            "delta_r2_vs_nobw",
+            "delta_shadow_area_vs_nobw",
+            "delta_shadow_area_d160_vs_nobw",
+        ]
+    ].agg(["mean", "std"])
     print("[R51] repeat mean/std:")
     print(stats.to_string())
 
@@ -283,7 +338,7 @@ def _run_compare_aionly(mode: str, epochs: int) -> Path:
     cases = [CASE_BASE, CASE_AIONLY]
     print(f"[R51] compare_aionly cases={cases} mode={mode} epochs={epochs}")
     run_root = _run_once(cases=cases, mode=mode, epochs=epochs)
-    df = _read_summary(run_root)
+    df = _attach_baseline_deltas(_read_summary(run_root))
     _print_brief_table(df)
     return run_root
 
@@ -307,14 +362,14 @@ def main() -> None:
         _print_repeat_summary(roots, CASE_BASE)
         return
 
-    if args.suite in ("repeat_longw", "repeat_candidate"):
-        roots = _run_repeats(CASE_MICRO_LONGW, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
-        _print_repeat_summary(roots, CASE_MICRO_LONGW)
+    if args.suite in ("repeat_depth", "repeat_candidate"):
+        roots = _run_repeats(CASE_TRIAL_DEPTH, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
+        _print_repeat_summary(roots, CASE_TRIAL_DEPTH)
         return
 
-    if args.suite == "repeat_well":
-        roots = _run_repeats(CASE_MICRO_WELL, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
-        _print_repeat_summary(roots, CASE_MICRO_WELL)
+    if args.suite in ("repeat_aibw", "repeat_longw", "repeat_well"):
+        roots = _run_repeats(CASE_TRIAL_AIBW, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
+        _print_repeat_summary(roots, CASE_TRIAL_AIBW)
         return
 
     if args.suite == "compare_aionly":
@@ -325,9 +380,9 @@ def main() -> None:
     # full: do 3-case confirmation first, then repeat selected formal line.
     _, selected, detail = _run_confirm3(mode=args.mode, epochs=int(args.epochs))
     if selected != CASE_BASE:
-        print(f"[R51] micro-case confirmed. Formal baseline upgraded to {selected}.")
+        print(f"[R51] deep-loss trial confirmed. Formal baseline upgraded to {selected}.")
     else:
-        print(f"[R51] no micro-case passed hard gate. Keep baseline {CASE_BASE}.")
+        print(f"[R51] no deep-loss trial passed hard gate. Keep baseline {CASE_BASE}.")
     print(f"[R51] decision detail: {detail}")
 
     roots = _run_repeats(selected, mode=args.mode, epochs=int(args.epochs), repeat_runs=int(args.repeat_runs))
