@@ -60,7 +60,9 @@ PAPER_TEST_USER: Dict[str, Any] = {
     "test_noise_save_inputs": True,
 }
 
-# The shared paper baseline is the final deployment recipe approved by the user.
+# The shared paper baseline is a CLEAN mechanism baseline for the main-method
+# matrix. Training-time robustness tricks are deliberately disabled here so the
+# table remains a traditional clean-train clean-test mechanism study.
 # Individual cases only remove or alter the specific mechanism under study.
 PAPER_MAIN_COMMON: Dict[str, Any] = {
     "use_aniso_conditioning": True,
@@ -84,10 +86,10 @@ PAPER_MAIN_COMMON: Dict[str, Any] = {
     "use_boundary_weight": False,
     "lambda_depth_grad": 0.0,
     "lambda_depth_hf": 0.0,
-    "train_noise_kind": "awgn",
-    "train_noise_prob": 0.5,
-    "train_noise_snr_db_choices": (30.0, 20.0),
-    "r_channel_dropout_prob": 0.3,
+    "train_noise_kind": "none",
+    "train_noise_prob": 0.0,
+    "train_noise_snr_db_choices": (),
+    "r_channel_dropout_prob": 0.0,
     "lambda_recon": 1.0,
     "lambda_facies": 0.2,
 }
@@ -146,8 +148,9 @@ PAPER_CASES: Dict[str, Dict[str, Any]] = {
         lambda_facies=0.2,
         run_id_suffix="_paper_inv_phys_facies_R_aniso_static",
     ),
-    # 6. Final full method. This is the paper main model and corresponds to the
-    # old experimental line skel_ref_nobddep_awgntrain_rdrop, renamed to avoid confusion.
+    # 6. Clean full mechanism model for the paper main table. Robustness-specific
+    # training tricks are intentionally excluded from matrix A and should be
+    # studied in a separate robustness table.
     "paper_main_full": _paper_case(
         use_aniso_conditioning=True,
         aniso_backend="skeleton_graph",
@@ -167,7 +170,7 @@ PAPER_CASE_NOTES: Dict[str, str] = {
     "paper_inv_phys_facies": "inverse + physics + facies auxiliary task",
     "paper_inv_phys_facies_R_iso_static": "isotropic static reliability conditioning",
     "paper_inv_phys_facies_R_aniso_static": "anisotropic skeleton reliability conditioning without iterative updates",
-    "paper_main_full": "final paper method: anisotropic iterative closed-loop under the fixed deployment recipe",
+    "paper_main_full": "clean full mechanism model: anisotropic iterative closed-loop without robustness-specific training tricks",
 }
 
 
@@ -364,7 +367,7 @@ def run_cases(cases: List[str], mode: str, epochs_override: int | None) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run paper main-mechanism ablation matrix A under a frozen deployment recipe."
+        description="Run paper main-mechanism ablation matrix A under a frozen clean-train clean-test baseline."
     )
     parser.add_argument(
         "--cases",
