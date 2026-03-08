@@ -66,6 +66,10 @@ TEST_USER_P = {
     "channel_id": TRAIN_USER_P["channel_id"],
     "test_init_bs": 32,
     "test_facies_bs": 64,
+    "test_noise_kind": "none",
+    "test_noise_snr_db": None,
+    "test_noise_seed": SEED,
+    "test_noise_save_inputs": True,
 }
 
 TEST_EXPERT_OVERRIDES = {}

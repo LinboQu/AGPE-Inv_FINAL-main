@@ -18,6 +18,7 @@ Usage (VSCode / F5):
   - use_aniso_conditioning=True/False
 """
 
+import json
 import os
 import errno
 import numpy as np
@@ -34,6 +35,7 @@ from model.geomorphology_classification import Facies_model_class
 from utils.utils import standardize
 from utils.datasets import SeismicDataset1D
 from utils.config_resolver import resolve_test_config, resolve_train_config
+from utils.noise import apply_test_noise, build_noise_label
 
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
@@ -532,6 +534,7 @@ def test(test_p: dict) -> dict:
         default_train_profile=TRAIN_PROFILE,
     )
     run_id, model_name = _resolve_run_id_and_model_name(cfg)
+    out_prefix = f"{model_name}_{cfg['data_flag']}"
     data_flag = cfg["data_flag"]
     no_wells = int(cfg.get("no_wells", 20))
     print(f"[TEST] resolved run_id={run_id} model_name={model_name}")
@@ -542,6 +545,30 @@ def test(test_p: dict) -> dict:
 
     ### 1. Load raw data (no standardization/cropping yet)
     seismic_raw, model_raw, facies_raw, meta = get_data_raw(data_flag=data_flag)
+    noise_kind = str(cfg.get("test_noise_kind", "none")).strip().lower()
+    noise_snr_db = cfg.get("test_noise_snr_db", None)
+    noise_seed = int(cfg.get("test_noise_seed", 2026))
+    noise_save_inputs = bool(cfg.get("test_noise_save_inputs", True))
+    noise_label = build_noise_label(noise_kind, noise_snr_db, noise_seed)
+    seismic_raw, meta, noise_meta = apply_test_noise(
+        seismic_raw=seismic_raw,
+        meta=meta,
+        noise_kind=noise_kind,
+        snr_db=noise_snr_db,
+        seed=noise_seed,
+    )
+    if noise_kind == "awgn":
+        print(
+            f"[NOISE] label={noise_meta['noise_label']} "
+            f"target={float(noise_meta['snr_db_target']):.2f} dB "
+            f"measured={float(noise_meta['snr_db_measured']):.4f} dB"
+        )
+        if noise_save_inputs:
+            np.save(f"results/{out_prefix}_noisy_seismic.npy", seismic_raw.astype(np.float32))
+            with open(f"results/{out_prefix}_noise_meta.json", "w", encoding="utf-8") as f:
+                json.dump(noise_meta, f, indent=2, ensure_ascii=True)
+    else:
+        print("[NOISE] label=clean")
 
     ### 2. Trace-order sanity check
     IL, XL, H = meta["inline"], meta["xline"], meta["H"]
@@ -601,6 +628,7 @@ def test(test_p: dict) -> dict:
 
     ### 8. Build anisotropic R channel (if enabled)
     R_flat = None
+    ai_boot = None
     if cfg.get("use_aniso_conditioning", False) and data_flag == "Stanford_VI":
         # Use selected real well locations from CSV as AGPE seeds.
         seed = int(cfg.get("seed", 2026))
@@ -736,7 +764,6 @@ def test(test_p: dict) -> dict:
         else:
             seismic[:, 1:2, :] = R_np
 
-        out_prefix = f"{model_name}_{data_flag}"
         save_R_visualization(R_flat, meta, out_prefix, depth_slices=(40, 100, 160))
 
     print(f"[TEST] final input shapes: seismic={seismic.shape}, model={model.shape}")
@@ -773,7 +800,6 @@ def test(test_p: dict) -> dict:
     AI_act_np = AI_act.detach().cpu().numpy()
 
     # Save predicted/ground-truth arrays.
-    out_prefix = f"{model_name}_{data_flag}"
     np.save(f"results/{out_prefix}_pred_AI.npy", AI_pred_np)
     np.save(f"results/{out_prefix}_true_AI.npy", AI_act_np)
 
@@ -809,6 +835,11 @@ def test(test_p: dict) -> dict:
         "run_id": run_id,
         "model_name": model_name,
         "data_flag": data_flag,
+        "noise_kind": str(noise_meta.get("noise_kind", "none")),
+        "noise_case": noise_label,
+        "noise_snr_db_target": noise_meta.get("snr_db_target", None),
+        "noise_snr_db_measured": noise_meta.get("snr_db_measured", None),
+        "noise_seed": noise_meta.get("seed", None),
         "r2": float(r2),
         "pcc": float(pcc),
         "p_value": float(p_value),
@@ -833,6 +864,33 @@ def test(test_p: dict) -> dict:
             abs_err_thresh=SHADOW_ABS_ERR_THRESH,
         )
     )
+
+    if ai_boot is not None:
+        bootstrap_r2 = float(r2_score(AI_act_np.ravel(), ai_boot.ravel()))
+        bootstrap_shadow = _compute_shadow_area_metrics(
+            ai_pred_flat=ai_boot,
+            ai_true_flat=AI_act_np,
+            meta=meta,
+            depth_slices=SHADOW_DEPTH_SLICES,
+            abs_err_thresh=SHADOW_ABS_ERR_THRESH,
+        )
+        metrics["bootstrap_r2"] = bootstrap_r2
+        metrics["final_r2"] = float(r2)
+        metrics["r2_final_minus_bootstrap"] = float(r2 - bootstrap_r2)
+        for key, value in bootstrap_shadow.items():
+            metrics[f"bootstrap_{key}"] = value
+        if "shadow_area_mean" in metrics and "shadow_area_mean" in bootstrap_shadow:
+            metrics["bootstrap_shadow_area_mean"] = float(bootstrap_shadow["shadow_area_mean"])
+            metrics["final_shadow_area_mean"] = float(metrics["shadow_area_mean"])
+            metrics["shadow_area_final_minus_bootstrap"] = float(
+                metrics["shadow_area_mean"] - bootstrap_shadow["shadow_area_mean"]
+            )
+        if "shadow_area_max" in metrics and "shadow_area_max" in bootstrap_shadow:
+            metrics["bootstrap_shadow_area_max"] = float(bootstrap_shadow["shadow_area_max"])
+            metrics["final_shadow_area_max"] = float(metrics["shadow_area_max"])
+            metrics["shadow_area_max_final_minus_bootstrap"] = float(
+                metrics["shadow_area_max"] - bootstrap_shadow["shadow_area_max"]
+            )
 
     # 12. Visualization
     if data_flag == "Stanford_VI":

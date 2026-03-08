@@ -52,6 +52,10 @@ TEST_USER_ALLOWED_KEYS = frozenset(
         "run_id",
         "model_name",
         "run_id_suffix",
+        "test_noise_kind",
+        "test_noise_snr_db",
+        "test_noise_seed",
+        "test_noise_save_inputs",
     }
 )
 
@@ -203,6 +207,10 @@ _TEST_BASE_DEFAULTS: dict[str, Any] = {
     "agpe_refine_graph": True,
     "agpe_rebuild_every": 50,
     "agpe_topo_change_pch_l1": 0.05,
+    "test_noise_kind": "none",
+    "test_noise_snr_db": None,
+    "test_noise_seed": DEFAULT_SEED,
+    "test_noise_save_inputs": True,
 }
 
 
@@ -326,6 +334,10 @@ _TEST_DIRECT_USER_KEYS = (
     "run_id",
     "model_name",
     "run_id_suffix",
+    "test_noise_kind",
+    "test_noise_snr_db",
+    "test_noise_seed",
+    "test_noise_save_inputs",
 )
 
 _TEST_SHARED_FROM_TRAIN_KEYS = (
