@@ -11,6 +11,7 @@ from openpyxl import Workbook
 
 from run_ablation import (
     CASE_PRESETS,
+    NOISE_CORE_CASES,
     _case_result_prefixes,
     _list_case_result_files,
     _move_file_safe,
@@ -52,6 +53,10 @@ REPEAT_SUMMARY_KEYS = (
     "final_shadow_area_mean",
     "shadow_area_final_minus_bootstrap",
 )
+
+
+def _case_block(case: str) -> str:
+    return "fair" if str(case).startswith("fair_") else "legacy"
 
 
 def _collect_headers(rows: list[dict]) -> list[str]:
@@ -181,6 +186,7 @@ def _build_case_metrics_row(
 ) -> dict:
     return {
         "case": case,
+        "case_block": _case_block(case),
         "artifact_dir": artifact_dir.as_posix(),
         "noise_case": noise_case,
         "repeat_idx": int(repeat_idx),
@@ -208,6 +214,10 @@ def _build_case_metrics_row(
         "use_boundary_weight": bool(train_cfg.get("use_boundary_weight", False)),
         "lambda_depth_grad": float(train_cfg.get("lambda_depth_grad", 0.0)),
         "lambda_depth_hf": float(train_cfg.get("lambda_depth_hf", 0.0)),
+        "train_noise_kind": str(train_cfg.get("train_noise_kind", "none")),
+        "train_noise_prob": float(train_cfg.get("train_noise_prob", 0.0)),
+        "train_noise_snr_db_choices": str(train_cfg.get("train_noise_snr_db_choices", ())),
+        "r_channel_dropout_prob": float(train_cfg.get("r_channel_dropout_prob", 0.0)),
         "iterative_R": bool(train_cfg.get("iterative_R", False)),
         **metrics,
     }
@@ -228,6 +238,7 @@ def _build_delta_rows(detail_rows: list[dict]) -> list[dict]:
 
         delta_row = {
             "case": row["case"],
+            "case_block": row.get("case_block", _case_block(str(row["case"]))),
             "noise_case": row["noise_case"],
             "repeat_idx": row["repeat_idx"],
             "noise_kind": row.get("noise_kind", None),
@@ -255,6 +266,7 @@ def _build_repeatability_rows(detail_rows: list[dict], repeats: int) -> list[dic
     for (case, noise_case), group in sorted(grouped.items()):
         row = {
             "case": case,
+            "case_block": _case_block(case),
             "noise_case": noise_case,
             "repeat_count": len(group),
             "noise_kind": group[0].get("noise_kind", None),
@@ -286,6 +298,27 @@ def _archive_existing_artifacts(results_root: Path, prefixes: tuple[str, str], r
     for path in old_files:
         _move_file_safe(path, archive_dir)
     print(f"[ARCHIVE] moved {len(old_files)} preexisting files -> {archive_dir.as_posix()}")
+
+
+def _save_grouped_summaries(
+    run_root: Path,
+    rows: list[dict],
+    stem: str,
+    sheet_name: str,
+) -> None:
+    grouped = {
+        "fair": [row for row in rows if row.get("case_block", _case_block(str(row.get("case", "")))) == "fair"],
+        "legacy": [row for row in rows if row.get("case_block", _case_block(str(row.get("case", "")))) == "legacy"],
+    }
+    for group_name, group_rows in grouped.items():
+        if not group_rows:
+            continue
+        csv_path = run_root / f"{stem}_{group_name}.csv"
+        xlsx_path = run_root / f"{stem}_{group_name}.xlsx"
+        _save_rows_csv(csv_path, group_rows)
+        _save_rows_excel(xlsx_path, group_rows, sheet_name=sheet_name)
+        print(f"[SAVE] {group_name} summary -> {csv_path.as_posix()}")
+        print(f"[SAVE] {group_name} summary -> {xlsx_path.as_posix()}")
 
 
 def run_ablation_noise(cases: list[str], snrs: list[float], repeats: int, seed: int) -> None:
@@ -352,6 +385,7 @@ def run_ablation_noise(cases: list[str], snrs: list[float], repeats: int, seed: 
     _save_rows_excel(detail_xlsx, detail_rows, sheet_name="summary")
     print(f"[SAVE] detail summary -> {detail_csv.as_posix()}")
     print(f"[SAVE] detail summary -> {detail_xlsx.as_posix()}")
+    _save_grouped_summaries(run_root, detail_rows, "ablation_noise_metrics_summary", "summary")
 
     delta_rows = _build_delta_rows(detail_rows)
     delta_csv = run_root / "ablation_noise_delta_summary.csv"
@@ -360,6 +394,7 @@ def run_ablation_noise(cases: list[str], snrs: list[float], repeats: int, seed: 
     _save_rows_excel(delta_xlsx, delta_rows, sheet_name="delta_summary")
     print(f"[SAVE] delta summary -> {delta_csv.as_posix()}")
     print(f"[SAVE] delta summary -> {delta_xlsx.as_posix()}")
+    _save_grouped_summaries(run_root, delta_rows, "ablation_noise_delta_summary", "delta_summary")
 
     repeat_rows = _build_repeatability_rows(detail_rows, repeats=int(repeats))
     if repeat_rows:
@@ -369,6 +404,7 @@ def run_ablation_noise(cases: list[str], snrs: list[float], repeats: int, seed: 
         _save_rows_excel(repeat_xlsx, repeat_rows, sheet_name="repeatability")
         print(f"[SAVE] repeatability summary -> {repeat_csv.as_posix()}")
         print(f"[SAVE] repeatability summary -> {repeat_xlsx.as_posix()}")
+        _save_grouped_summaries(run_root, repeat_rows, "ablation_noise_repeatability_summary", "repeatability")
 
 
 def parse_args() -> argparse.Namespace:
@@ -378,9 +414,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cases",
         nargs="+",
-        default=sorted(CASE_PRESETS.keys()),
+        default=list(NOISE_CORE_CASES),
         choices=sorted(CASE_PRESETS.keys()),
-        help="Ablation cases to evaluate (default: all cases).",
+        help="Ablation cases to evaluate (default: next-round core shortlist).",
     )
     parser.add_argument(
         "--snrs",

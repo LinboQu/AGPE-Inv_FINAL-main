@@ -4,6 +4,7 @@ import math
 from typing import Any, Mapping
 
 import numpy as np
+import torch
 
 
 def _format_snr_db(snr_db: float | int) -> str:
@@ -28,6 +29,25 @@ def build_noise_label(
             raise ValueError("seed is required when noise_kind='awgn'.")
         return f"awgn_{_format_snr_db(snr_db)}db_seed{int(seed)}"
     raise ValueError(f"Unsupported noise_kind='{noise_kind}'.")
+
+
+def normalize_snr_choices(snr_choices: Any) -> tuple[float, ...]:
+    if snr_choices is None:
+        return ()
+    if isinstance(snr_choices, str):
+        text = snr_choices.strip()
+        if text == "":
+            return ()
+        for token in "[]()":
+            text = text.replace(token, " ")
+        text = text.replace(";", ",")
+        parts = [p.strip() for chunk in text.split(",") for p in chunk.split() if p.strip()]
+        return tuple(float(part) for part in parts)
+    if isinstance(snr_choices, np.ndarray):
+        return tuple(float(x) for x in snr_choices.reshape(-1).tolist())
+    if isinstance(snr_choices, (list, tuple, set)):
+        return tuple(float(x) for x in snr_choices)
+    return (float(snr_choices),)
 
 
 def measure_snr_db(clean: np.ndarray, noisy: np.ndarray) -> float:
@@ -142,3 +162,59 @@ def apply_test_noise(
     seismic_noisy, noise_meta = add_awgn_by_snr(seismic_raw, snr_db=snr_db, seed=seed)
     meta_out["seismic3d"] = _rebuild_seismic3d_from_flat(seismic_noisy, meta_out)
     return seismic_noisy, meta_out, noise_meta
+
+
+def apply_train_input_perturbation(
+    seismic_batch: torch.Tensor,
+    noise_kind: str | None = None,
+    noise_prob: float = 0.0,
+    noise_snr_db_choices: Any = None,
+    r_channel_dropout_prob: float = 0.0,
+    seed: int | None = None,
+) -> torch.Tensor:
+    if seismic_batch.ndim != 3:
+        raise ValueError(
+            f"Expected seismic_batch with shape [B,C,H], got {tuple(seismic_batch.shape)}"
+        )
+
+    out = seismic_batch.clone()
+    noise_kind_norm = str(noise_kind or "none").strip().lower()
+    noise_prob_value = float(np.clip(float(noise_prob), 0.0, 1.0))
+    rdrop_prob_value = float(np.clip(float(r_channel_dropout_prob), 0.0, 1.0))
+    snr_choices = normalize_snr_choices(noise_snr_db_choices)
+
+    use_awgn = (noise_kind_norm == "awgn") and (noise_prob_value > 0.0) and (len(snr_choices) > 0)
+    use_rdrop = (out.shape[1] > 1) and (rdrop_prob_value > 0.0)
+    if not use_awgn and not use_rdrop:
+        return out
+
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(0 if seed is None else seed))
+    batch_size = int(out.shape[0])
+
+    if use_awgn:
+        amp_cpu = out[:, 0, :].detach().to(device="cpu", dtype=torch.float32)
+        apply_mask = torch.rand((batch_size,), generator=gen, device="cpu") < noise_prob_value
+        if bool(apply_mask.any()):
+            snr_values = torch.tensor(snr_choices, dtype=torch.float32, device="cpu")
+            snr_idx = torch.randint(
+                low=0,
+                high=int(len(snr_choices)),
+                size=(batch_size,),
+                generator=gen,
+                device="cpu",
+            )
+            chosen_snr = snr_values[snr_idx].unsqueeze(1)
+            signal_power = amp_cpu.pow(2).mean(dim=1, keepdim=True).clamp_min(1e-12)
+            noise_power = signal_power / torch.pow(torch.tensor(10.0, dtype=torch.float32), chosen_snr / 10.0)
+            sigma = noise_power.sqrt()
+            noise = torch.randn(amp_cpu.shape, generator=gen, device="cpu") * sigma
+            amp_cpu[apply_mask] = amp_cpu[apply_mask] + noise[apply_mask]
+            out[:, 0, :] = amp_cpu.to(device=out.device, dtype=out.dtype)
+
+    if use_rdrop:
+        drop_mask = torch.rand((batch_size,), generator=gen, device="cpu") < rdrop_prob_value
+        if bool(drop_mask.any()):
+            out[drop_mask.to(device=out.device), 1:2, :] = 0.0
+
+    return out

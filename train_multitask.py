@@ -43,6 +43,7 @@ from setting import TCN1D_train_p, TRAIN_PROFILE
 from utils.utils import standardize
 from utils.datasets import SeismicDataset1D, SeismicDataset1D_SPF, SeismicDataset1D_SPF_WS
 from utils.config_resolver import resolve_train_config
+from utils.noise import apply_train_input_perturbation, normalize_snr_choices
 from utils.reliability_aniso import build_R_and_prior_from_cube
 
 
@@ -556,6 +557,18 @@ def train(train_p: dict):
     )
     facies_detach_y_late = bool(train_p.get("facies_detach_y_late", True))
     grad_clip = float(train_p.get("grad_clip", 0.0))
+    train_noise_kind = str(train_p.get("train_noise_kind", "none")).strip().lower()
+    train_noise_prob = float(train_p.get("train_noise_prob", 0.0))
+    train_noise_snr_db_choices = normalize_snr_choices(train_p.get("train_noise_snr_db_choices", ()))
+    r_channel_dropout_prob = float(train_p.get("r_channel_dropout_prob", 0.0))
+    if train_noise_kind not in ("none", "awgn"):
+        raise ValueError(f"Unsupported train_noise_kind: {train_noise_kind}")
+    if train_noise_kind == "awgn" and float(train_noise_prob) > 0.0 and len(train_noise_snr_db_choices) == 0:
+        print("[TRAIN-NOISE][WARN] AWGN enabled but train_noise_snr_db_choices is empty; augmentation disabled.")
+    print(
+        f"[TRAIN-NOISE] kind={train_noise_kind} prob={train_noise_prob:.3f} "
+        f"snrs={train_noise_snr_db_choices} r_channel_dropout_prob={r_channel_dropout_prob:.3f}"
+    )
 
     optimizer = torch.optim.Adam(
         list(inverse_model.parameters()) + list(forward_model.parameters()) + list(Facies_model.parameters()),
@@ -648,6 +661,33 @@ def train(train_p: dict):
             return float(boundary_weight_beta)
         warm = _linear_warm_factor(epoch, boundary_warm_start_epoch, boundary_warm_ramp_epochs)
         return float(boundary_beta_start) * (1.0 - warm) + float(boundary_beta_end) * warm
+
+    def _augment_inverse_input(
+        x_clean: torch.Tensor,
+        epoch: int,
+        batch_idx: int,
+        stream_id: int,
+    ) -> torch.Tensor:
+        if (
+            train_noise_kind == "none"
+            and float(train_noise_prob) <= 0.0
+            and float(r_channel_dropout_prob) <= 0.0
+        ):
+            return x_clean
+        batch_seed = (
+            int(seed)
+            + (int(epoch) + 1) * 1000003
+            + (int(batch_idx) + 1) * 10007
+            + int(stream_id) * 101
+        )
+        return apply_train_input_perturbation(
+            seismic_batch=x_clean,
+            noise_kind=train_noise_kind,
+            noise_prob=train_noise_prob,
+            noise_snr_db_choices=train_noise_snr_db_choices,
+            r_channel_dropout_prob=r_channel_dropout_prob,
+            seed=batch_seed,
+        )
 
     def _depth_diff(x: torch.Tensor) -> torch.Tensor:
         # First-order depth gradient.
@@ -910,7 +950,8 @@ def train(train_p: dict):
                 if prior_b is not None:
                     prior_b = prior_b.to(device, non_blocking=True)
 
-                y_pred = inverse_model(x)
+                x_in = _augment_inverse_input(x, epoch=epoch, batch_idx=bi, stream_id=17)
+                y_pred = inverse_model(x_in)
                 x_rec = forward_model(y_pred)
                 fac_in = y_pred.detach() if fac_detach_t else y_pred
                 fac_logits = Facies_model(fac_in)
@@ -919,7 +960,7 @@ def train(train_p: dict):
 
                 if prior_b is not None and bool(train_p.get("use_soft_prior", False)):
                     # weight by current R channel if present
-                    Rch = x[:, 1:2, :] if x.shape[1] > 1 else 1.0
+                    Rch = x_in[:, 1:2, :] if x_in.shape[1] > 1 else 1.0
                     w = 0.1 + 0.9 * Rch
                     l_prior = ((y_pred - prior_b) ** 2 * w).mean() * float(train_p.get("lambda_prior", 0.20))
                     loss_ws = loss_ws + l_prior
@@ -946,7 +987,8 @@ def train(train_p: dict):
             y = y.to(device, non_blocking=True)
             z = z.to(device, non_blocking=True)
 
-            y_pred = inverse_model(x)
+            x_in = _augment_inverse_input(x, epoch=epoch, batch_idx=nb, stream_id=31)
+            y_pred = inverse_model(x_in)
             x_rec = forward_model(y_pred)
             fac_in = y_pred.detach() if fac_detach_t else y_pred
             fac_logits = Facies_model(fac_in)

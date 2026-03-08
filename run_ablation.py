@@ -58,11 +58,45 @@ FAIR_ABLATION_COMMON: Dict[str, object] = {
     "lambda_facies": 0.2,
 }
 
+TRAIN_AWGN_COMMON: Dict[str, object] = {
+    "train_noise_kind": "awgn",
+    "train_noise_prob": 0.5,
+    "train_noise_snr_db_choices": (30.0, 20.0),
+}
+
 
 def _fair_case(**overrides: object) -> Dict[str, object]:
     out = copy.deepcopy(FAIR_ABLATION_COMMON)
     out.update(overrides)
     return out
+
+
+NOISE_CORE_CASES: List[str] = [
+    "fair_baseline_1d",
+    "fair_physics_only",
+    "fair_farp_noniter",
+    "fair_farp_isotropic",
+    "fair_proposed",
+    "fair_proposed_rb50",
+    "fair_proposed_nobddep_rb100",
+    "fair_proposed_nobddep_rb50",
+    "skel_ref_nobddep",
+]
+
+REPEATABILITY_SHORTLIST: List[str] = [
+    "fair_proposed",
+    "fair_proposed_rb50",
+    "fair_proposed_nobddep_rb100",
+    "fair_proposed_nobddep_rb50",
+    "skel_ref_nobddep",
+]
+
+TRAIN_NOISE_CANDIDATES: List[str] = [
+    "fair_proposed",
+    "fair_proposed_awgntrain",
+    "fair_proposed_awgntrain_rdrop",
+    "skel_ref_nobddep_awgntrain_rdrop",
+]
 
 
 CASE_PRESETS: Dict[str, Dict[str, object]] = {
@@ -274,6 +308,46 @@ CASE_PRESETS: Dict[str, Dict[str, object]] = {
         lambda_depth_hf=0.0,
         run_id_suffix="_fair_proposed_nobddep_rb100",
     ),
+    # Deconfound-C: disable depth losses + rebuild every 50 for the 2x2 interaction test.
+    "fair_proposed_nobddep_rb50": _fair_case(
+        agpe_rebuild_every=50,
+        lambda_depth_grad=0.0,
+        lambda_depth_hf=0.0,
+        run_id_suffix="_fair_proposed_nobddep_rb50",
+    ),
+    # Robustness candidate-A: fair_proposed with AWGN train augmentation on seismic input only.
+    "fair_proposed_awgntrain": _fair_case(
+        train_noise_kind=TRAIN_AWGN_COMMON["train_noise_kind"],
+        train_noise_prob=TRAIN_AWGN_COMMON["train_noise_prob"],
+        train_noise_snr_db_choices=TRAIN_AWGN_COMMON["train_noise_snr_db_choices"],
+        run_id_suffix="_fair_proposed_awgntrain",
+    ),
+    # Robustness candidate-B: fair_proposed with AWGN train augmentation + R-channel dropout.
+    "fair_proposed_awgntrain_rdrop": _fair_case(
+        train_noise_kind=TRAIN_AWGN_COMMON["train_noise_kind"],
+        train_noise_prob=TRAIN_AWGN_COMMON["train_noise_prob"],
+        train_noise_snr_db_choices=TRAIN_AWGN_COMMON["train_noise_snr_db_choices"],
+        r_channel_dropout_prob=0.3,
+        run_id_suffix="_fair_proposed_awgntrain_rdrop",
+    ),
+    # Robustness candidate-C: skel_ref_nobddep with AWGN train augmentation + R-channel dropout.
+    "skel_ref_nobddep_awgntrain_rdrop": {
+        "aniso_backend": "skeleton_graph",
+        "aniso_use_tensor_strength": True,
+        "agpe_long_edges": True,
+        "iterative_R": True,
+        "agpe_cache_graph": True,
+        "agpe_refine_graph": True,
+        "agpe_rebuild_every": 50,
+        "use_boundary_weight": False,
+        "lambda_depth_grad": 0.0,
+        "lambda_depth_hf": 0.0,
+        "train_noise_kind": TRAIN_AWGN_COMMON["train_noise_kind"],
+        "train_noise_prob": TRAIN_AWGN_COMMON["train_noise_prob"],
+        "train_noise_snr_db_choices": TRAIN_AWGN_COMMON["train_noise_snr_db_choices"],
+        "r_channel_dropout_prob": 0.3,
+        "run_id_suffix": "_skel_ref_nobddep_awgntrain_rdrop",
+    },
 }
 
 
@@ -442,6 +516,10 @@ def run_cases(cases: List[str], mode: str, epochs_override: int | None) -> None:
                     "use_boundary_weight": bool(train_cfg.get("use_boundary_weight", False)),
                     "lambda_depth_grad": float(train_cfg.get("lambda_depth_grad", 0.0)),
                     "lambda_depth_hf": float(train_cfg.get("lambda_depth_hf", 0.0)),
+                    "train_noise_kind": str(train_cfg.get("train_noise_kind", "none")),
+                    "train_noise_prob": float(train_cfg.get("train_noise_prob", 0.0)),
+                    "train_noise_snr_db_choices": str(train_cfg.get("train_noise_snr_db_choices", ())),
+                    "r_channel_dropout_prob": float(train_cfg.get("r_channel_dropout_prob", 0.0)),
                     "iterative_R": bool(train_cfg.get("iterative_R", False)),
                     **metrics,
                 }
