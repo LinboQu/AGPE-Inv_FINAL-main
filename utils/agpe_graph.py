@@ -548,7 +548,7 @@ def maybe_rebuild_cache(
 
 
 @torch.no_grad()
-def update_edge_weight_only(
+def compute_edge_weight_terms(
     cache_slice: AGPESliceCache,
     pch: torch.Tensor,
     conf: torch.Tensor | None,
@@ -565,8 +565,8 @@ def update_edge_weight_only(
     agpe_long_edges: bool,
     agpe_long_weight: float,
     eps: float = 1e-8,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Update edge weights on a fixed skeleton topology."""
+) -> dict[str, torch.Tensor]:
+    """Compute decomposed skeleton-graph edge terms on a fixed topology."""
     device = pch.device
     dtype = pch.dtype
 
@@ -631,6 +631,7 @@ def update_edge_weight_only(
     a = torch.exp(float(kappa) * strength_nodes[dst] * (cos * cos))
 
     if feat_nodes is None:
+        dist = torch.zeros_like(g)
         s = torch.ones_like(g)
     else:
         dist = torch.sqrt(((feat_nodes[dst] - feat_nodes[src]) ** 2).sum(dim=1) + eps)
@@ -640,9 +641,69 @@ def update_edge_weight_only(
     p_edge = torch.exp(-torch.abs(pch_nodes[dst] - pch_nodes[src]) / edge_tau_p)
     p_edge = p_edge * (conf_nodes[dst] * conf_nodes[src])
 
-    w = g * a * s * p_edge
+    w_base = g * a * s * p_edge
     if bool(agpe_long_edges):
-        w = torch.where(is_long, w * float(agpe_long_weight), w)
+        w = torch.where(is_long, w_base * float(agpe_long_weight), w_base)
+    else:
+        w = w_base
     w = w.clamp(min=eps)
 
-    return src, dst, w
+    return {
+        "src": src,
+        "dst": dst,
+        "is_long": is_long,
+        "rr": rr,
+        "cc": cc,
+        "pch_nodes": pch_nodes,
+        "conf_nodes": conf_nodes,
+        "strength_nodes": strength_nodes,
+        "cos": cos,
+        "dist": dist,
+        "g": g,
+        "a": a,
+        "s": s,
+        "p_edge": p_edge,
+        "w_base": w_base,
+        "w": w,
+    }
+
+
+@torch.no_grad()
+def update_edge_weight_only(
+    cache_slice: AGPESliceCache,
+    pch: torch.Tensor,
+    conf: torch.Tensor | None,
+    v: torch.Tensor,
+    strength: torch.Tensor | None,
+    feat: torch.Tensor | None,
+    damp: torch.Tensor | None,
+    gamma: float,
+    tau: float,
+    kappa: float,
+    use_tensor_strength: bool,
+    tensor_strength_power: float,
+    agpe_edge_tau_p: float,
+    agpe_long_edges: bool,
+    agpe_long_weight: float,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Update edge weights on a fixed skeleton topology."""
+    terms = compute_edge_weight_terms(
+        cache_slice=cache_slice,
+        pch=pch,
+        conf=conf,
+        v=v,
+        strength=strength,
+        feat=feat,
+        damp=damp,
+        gamma=gamma,
+        tau=tau,
+        kappa=kappa,
+        use_tensor_strength=use_tensor_strength,
+        tensor_strength_power=tensor_strength_power,
+        agpe_edge_tau_p=agpe_edge_tau_p,
+        agpe_long_edges=agpe_long_edges,
+        agpe_long_weight=agpe_long_weight,
+        eps=eps,
+    )
+    return terms["src"], terms["dst"], terms["w"]

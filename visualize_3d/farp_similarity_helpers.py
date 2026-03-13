@@ -6,6 +6,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.collections import LineCollection
 
 
 def build_default_config(repo_root: Path | None = None) -> dict:
@@ -42,7 +43,7 @@ def build_default_config(repo_root: Path | None = None) -> dict:
         "anchor_mode": "well",
         "manual_inline": 57,
         "manual_xline": 68,
-        "backend": "graph_lattice",
+        "backend": "skeleton_graph",
         "steps_r": 25,
         "eta": 0.6,
         "gamma": 8.0,
@@ -52,16 +53,29 @@ def build_default_config(repo_root: Path | None = None) -> dict:
         "well_soft_alpha": 0.20,
         "use_tensor_strength": False,
         "tensor_strength_power": 1.0,
+        "agpe_skel_p_thresh": 0.55,
+        "agpe_skel_min_nodes": 30,
+        "agpe_skel_snap_radius": 5,
+        "agpe_long_edges": True,
+        "agpe_long_max_step": 6,
+        "agpe_long_step": 2,
+        "agpe_long_cos_thresh": 0.70,
+        "agpe_long_weight": 0.35,
+        "agpe_edge_tau_p": 0.25,
+        "agpe_lift_sigma": 2.2,
         "local_radius": 10,
         "quiver_step": 10,
         "sim_clip": (1.0, 99.0),
         "fig_dpi": 180,
         "feature_scatter_max_points": 30000,
         "feature_scatter_seed": 2026,
+        "graph_edge_max_plot": 7000,
+        "diffusion_capture_steps": (0, 1, 5, 12, 25),
+        "stack_depth_offsets": (-2, -1, 0, 1, 2),
         "save_outputs": False,
         "compute_slice_r": True,
         "compute_full_r": False,
-        "full_r_backend": "graph_lattice",
+        "full_r_backend": "skeleton_graph",
     }
 
 
@@ -273,6 +287,367 @@ def _choose_anchor(cfg: dict, wells: list[dict], gmag_slice: np.ndarray) -> dict
     raise ValueError(f"Unknown anchor_mode={cfg['anchor_mode']}")
 
 
+def _resolve_capture_steps(cfg: dict) -> list[int]:
+    steps_r = int(cfg["steps_r"])
+    raw_steps = cfg.get("diffusion_capture_steps", (0, 1, steps_r // 2, steps_r))
+    capture = {0, steps_r}
+    for step in raw_steps:
+        step_i = int(step)
+        if 0 <= step_i <= steps_r:
+            capture.add(step_i)
+    return sorted(capture)
+
+
+def _node_values_to_grid(
+    node_rc: np.ndarray,
+    values: np.ndarray,
+    shape: tuple[int, int],
+    *,
+    fill_value: float = np.nan,
+) -> np.ndarray:
+    out = np.full(shape, fill_value, dtype=np.float32)
+    if node_rc.size == 0 or values.size == 0:
+        return out
+    rows = node_rc[:, 0].astype(np.int64, copy=False)
+    cols = node_rc[:, 1].astype(np.int64, copy=False)
+    out[rows, cols] = np.asarray(values, dtype=np.float32).reshape(-1)
+    return out
+
+
+def _edge_mean_to_nodes(dst_idx: np.ndarray, values: np.ndarray, n_nodes: int) -> np.ndarray:
+    out = np.full((n_nodes,), np.nan, dtype=np.float32)
+    if n_nodes <= 0 or dst_idx.size == 0 or values.size == 0:
+        return out
+    sums = np.zeros((n_nodes,), dtype=np.float64)
+    cnt = np.zeros((n_nodes,), dtype=np.float64)
+    np.add.at(sums, dst_idx.astype(np.int64, copy=False), np.asarray(values, dtype=np.float64))
+    np.add.at(cnt, dst_idx.astype(np.int64, copy=False), 1.0)
+    valid = cnt > 0.0
+    out[valid] = (sums[valid] / cnt[valid]).astype(np.float32)
+    return out
+
+
+def _edge_sum_to_nodes(dst_idx: np.ndarray, values: np.ndarray, n_nodes: int) -> np.ndarray:
+    out = np.zeros((n_nodes,), dtype=np.float32)
+    if n_nodes <= 0 or dst_idx.size == 0 or values.size == 0:
+        return out
+    np.add.at(out, dst_idx.astype(np.int64, copy=False), np.asarray(values, dtype=np.float32))
+    return out
+
+
+def _compute_degree_maps(node_rc: np.ndarray, src_idx: np.ndarray, dst_idx: np.ndarray, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    n_nodes = int(node_rc.shape[0])
+    in_deg = np.zeros((n_nodes,), dtype=np.float32)
+    out_deg = np.zeros((n_nodes,), dtype=np.float32)
+    if dst_idx.size > 0:
+        np.add.at(in_deg, dst_idx.astype(np.int64, copy=False), 1.0)
+    if src_idx.size > 0:
+        np.add.at(out_deg, src_idx.astype(np.int64, copy=False), 1.0)
+    total_deg = in_deg + out_deg
+    return {
+        "in": _node_values_to_grid(node_rc, in_deg, shape, fill_value=np.nan),
+        "out": _node_values_to_grid(node_rc, out_deg, shape, fill_value=np.nan),
+        "total": _node_values_to_grid(node_rc, total_deg, shape, fill_value=np.nan),
+    }
+
+
+def _snap_well_seeds_with_mapping(
+    well_mask_2d: np.ndarray,
+    node_map: np.ndarray,
+    snap_radius: int,
+) -> dict:
+    wm_np = np.asarray(well_mask_2d, dtype=np.float32)
+    node_map = np.asarray(node_map, dtype=np.int32)
+    il, xl = node_map.shape
+
+    raw_seed_rc = np.argwhere(wm_np > 0.0).astype(np.int32)
+    raw_seed_val = np.asarray([wm_np[int(r), int(c)] for r, c in raw_seed_rc], dtype=np.float32)
+    seed_nodes: dict[int, float] = {}
+    snapped_records: list[dict] = []
+    failed_records: list[dict] = []
+    snap_ok = 0
+    r_snap = max(int(snap_radius), 0)
+
+    for r0, c0 in raw_seed_rc:
+        r0_i = int(r0)
+        c0_i = int(c0)
+        wv = float(wm_np[r0_i, c0_i])
+        if wv <= 0.0:
+            continue
+        idx = int(node_map[r0_i, c0_i])
+        snap_rc: tuple[int, int] | None = None
+        if idx >= 0:
+            snap_rc = (r0_i, c0_i)
+        elif r_snap > 0:
+            rr0 = max(0, r0_i - r_snap)
+            rr1 = min(il, r0_i + r_snap + 1)
+            cc0 = max(0, c0_i - r_snap)
+            cc1 = min(xl, c0_i + r_snap + 1)
+            sub = node_map[rr0:rr1, cc0:cc1]
+            cand = np.argwhere(sub >= 0)
+            if cand.size > 0:
+                cand[:, 0] += rr0
+                cand[:, 1] += cc0
+                d2 = (cand[:, 0] - r0_i) ** 2 + (cand[:, 1] - c0_i) ** 2
+                best = cand[int(np.argmin(d2))]
+                idx = int(node_map[int(best[0]), int(best[1])])
+                if idx >= 0:
+                    snap_rc = (int(best[0]), int(best[1]))
+        if idx >= 0 and snap_rc is not None:
+            seed_nodes[idx] = max(seed_nodes.get(idx, 0.0), wv)
+            snapped_records.append(
+                {
+                    "raw_rc": (r0_i, c0_i),
+                    "snap_rc": snap_rc,
+                    "node_idx": idx,
+                    "value": wv,
+                }
+            )
+            snap_ok += 1
+        else:
+            failed_records.append({"raw_rc": (r0_i, c0_i), "value": wv})
+
+    if seed_nodes:
+        seed_idx = np.asarray(sorted(seed_nodes.keys()), dtype=np.int64)
+        seed_val = np.asarray([seed_nodes[int(k)] for k in seed_idx], dtype=np.float32)
+        seed_val = np.clip(seed_val, 0.0, 1.0)
+    else:
+        seed_idx = np.empty((0,), dtype=np.int64)
+        seed_val = np.empty((0,), dtype=np.float32)
+
+    return {
+        "raw_seed_rc": raw_seed_rc,
+        "raw_seed_val": raw_seed_val,
+        "snapped_records": snapped_records,
+        "failed_records": failed_records,
+        "seed_idx": seed_idx,
+        "seed_val": seed_val,
+        "seed_total": int(raw_seed_rc.shape[0]),
+        "snap_ok": int(snap_ok),
+    }
+
+
+def _graph_diffuse_with_history(
+    r0_flat,
+    well_mask_flat,
+    src,
+    dst,
+    w,
+    *,
+    steps: int,
+    eta: float,
+    well_soft_alpha: float,
+    eps: float,
+    capture_steps: list[int],
+) -> tuple[np.ndarray, dict[int, np.ndarray]]:
+    alpha = float(well_soft_alpha)
+    r = r0_flat.clone()
+    history: dict[int, np.ndarray] = {}
+    capture = set(int(x) for x in capture_steps)
+    if 0 in capture:
+        history[0] = r.detach().cpu().numpy().astype(np.float32)
+
+    for step in range(1, int(steps) + 1):
+        acc = r.new_zeros(r.shape)
+        den = r.new_zeros(r.shape)
+        acc.index_add_(0, dst, w * r[src])
+        den.index_add_(0, dst, w)
+        r_prop = acc / (den + float(eps))
+        r = (1.0 - float(eta)) * r + float(eta) * r_prop
+        r = r.maximum(well_mask_flat)
+        if step in capture:
+            history[step] = r.detach().cpu().numpy().astype(np.float32)
+
+    if 0.0 < alpha < 1.0 - 1e-8:
+        r = ((1.0 - alpha) * r + alpha * well_mask_flat).clamp(0.0, 1.0)
+    if int(steps) in capture:
+        history[int(steps)] = r.detach().cpu().numpy().astype(np.float32)
+    return r.detach().cpu().numpy().astype(np.float32), history
+
+
+def _collect_skeleton_slice_debug(
+    *,
+    cfg: dict,
+    torch,
+    pch_slice: np.ndarray,
+    conf_slice: np.ndarray,
+    feat_slice: np.ndarray,
+    v_slice: np.ndarray,
+    strength_slice: np.ndarray,
+    well_mask_2d: np.ndarray,
+    build_cache_for_slice,
+    compute_edge_weight_terms,
+    lift_nodes_to_grid_cached,
+    apply_well_constraint,
+) -> dict:
+    pch_t = torch.from_numpy(np.asarray(pch_slice, dtype=np.float32))
+    conf_t = torch.from_numpy(np.asarray(conf_slice, dtype=np.float32))
+    feat_t = torch.from_numpy(np.asarray(feat_slice, dtype=np.float32))
+    v_t = torch.from_numpy(np.asarray(v_slice, dtype=np.float32))
+    strength_t = torch.from_numpy(np.asarray(strength_slice, dtype=np.float32))
+    wm_t = torch.from_numpy(np.asarray(well_mask_2d, dtype=np.float32))
+
+    mask_np = (np.asarray(pch_slice, dtype=np.float32) >= float(cfg["agpe_skel_p_thresh"])) & (
+        np.asarray(conf_slice, dtype=np.float32) > 0.0
+    )
+    out = {
+        "enabled": True,
+        "mask": mask_np.astype(bool, copy=False),
+        "cache_available": False,
+        "fallback_reason": None,
+        "capture_steps": _resolve_capture_steps(cfg),
+        "seed_total": int(np.count_nonzero(well_mask_2d > 0.0)),
+        "snap_ok": 0,
+    }
+
+    cache_slice = build_cache_for_slice(
+        pch=pch_t,
+        conf=conf_t,
+        v=v_t,
+        il=int(pch_slice.shape[0]),
+        xl=int(pch_slice.shape[1]),
+        p_thresh=float(cfg["agpe_skel_p_thresh"]),
+        min_nodes=int(cfg["agpe_skel_min_nodes"]),
+        long_edges=bool(cfg["agpe_long_edges"]),
+        long_max_step=int(cfg["agpe_long_max_step"]),
+        long_step=int(cfg["agpe_long_step"]),
+        long_cos_thresh=float(cfg["agpe_long_cos_thresh"]),
+    )
+
+    if cache_slice is None:
+        out["fallback_reason"] = "cache_unavailable"
+        return out
+
+    out["cache_available"] = True
+    out["cache_slice"] = cache_slice
+    out["skel_mask"] = cache_slice.skel_mask.astype(bool, copy=False)
+    out["node_rc"] = cache_slice.node_rc.astype(np.int32, copy=False)
+    out["node_map"] = cache_slice.node_map.astype(np.int32, copy=False)
+    out["src"] = cache_slice.src.astype(np.int64, copy=False)
+    out["dst"] = cache_slice.dst.astype(np.int64, copy=False)
+    out["is_long"] = cache_slice.is_long.astype(bool, copy=False)
+    out["n_nodes"] = int(cache_slice.n_nodes)
+    out["n_edges"] = int(cache_slice.n_edges)
+    out["n_long_edges"] = int(cache_slice.n_long_edges)
+    out["degree_maps"] = _compute_degree_maps(cache_slice.node_rc, cache_slice.src, cache_slice.dst, pch_slice.shape)
+
+    snap = _snap_well_seeds_with_mapping(well_mask_2d=well_mask_2d, node_map=cache_slice.node_map, snap_radius=int(cfg["agpe_skel_snap_radius"]))
+    out.update(snap)
+    out["snap_ok"] = int(snap["snap_ok"])
+    out["snapped_seed_rc"] = (
+        cache_slice.node_rc[snap["seed_idx"]] if snap["seed_idx"].size > 0 else np.empty((0, 2), dtype=np.int32)
+    )
+
+    terms_t = compute_edge_weight_terms(
+        cache_slice=cache_slice,
+        pch=pch_t,
+        conf=conf_t,
+        v=v_t,
+        strength=strength_t,
+        feat=feat_t,
+        damp=None,
+        gamma=float(cfg["gamma"]),
+        tau=float(cfg["tau"]),
+        kappa=float(cfg["kappa"]),
+        use_tensor_strength=bool(cfg["use_tensor_strength"]),
+        tensor_strength_power=float(cfg["tensor_strength_power"]),
+        agpe_edge_tau_p=float(cfg["agpe_edge_tau_p"]),
+        agpe_long_edges=bool(cfg["agpe_long_edges"]),
+        agpe_long_weight=float(cfg["agpe_long_weight"]),
+        eps=1e-8,
+    )
+    edge_terms = {key: value.detach().cpu().numpy().astype(np.float32) for key, value in terms_t.items() if key not in {"src", "dst", "is_long", "rr", "cc"}}
+    out["edge_terms"] = edge_terms
+    out["src_plot"] = terms_t["src"].detach().cpu().numpy().astype(np.int64)
+    out["dst_plot"] = terms_t["dst"].detach().cpu().numpy().astype(np.int64)
+    out["is_long_plot"] = terms_t["is_long"].detach().cpu().numpy().astype(bool)
+    out["edge_node_means"] = {
+        name: _node_values_to_grid(
+            cache_slice.node_rc,
+            _edge_mean_to_nodes(out["dst_plot"], values, int(cache_slice.n_nodes)),
+            pch_slice.shape,
+            fill_value=np.nan,
+        )
+        for name, values in edge_terms.items()
+        if values.ndim == 1 and values.shape[0] == out["dst_plot"].shape[0]
+    }
+    local_count_nodes = _edge_sum_to_nodes(out["dst_plot"][~out["is_long_plot"]], np.ones((np.count_nonzero(~out["is_long_plot"]),), dtype=np.float32), int(cache_slice.n_nodes))
+    long_count_nodes = _edge_sum_to_nodes(out["dst_plot"][out["is_long_plot"]], np.ones((np.count_nonzero(out["is_long_plot"]),), dtype=np.float32), int(cache_slice.n_nodes))
+    out["edge_count_nodes"] = {
+        "local_in": local_count_nodes,
+        "long_in": long_count_nodes,
+    }
+    out["edge_count_maps"] = {
+        "local_in": _node_values_to_grid(cache_slice.node_rc, local_count_nodes, pch_slice.shape, fill_value=np.nan),
+        "long_in": _node_values_to_grid(cache_slice.node_rc, long_count_nodes, pch_slice.shape, fill_value=np.nan),
+    }
+
+    node_n = int(cache_slice.n_nodes)
+    r0 = torch.zeros((node_n,), dtype=torch.float32)
+    wm_node = torch.zeros_like(r0)
+    if snap["seed_idx"].size > 0:
+        seed_idx_t = torch.from_numpy(snap["seed_idx"]).to(dtype=torch.long)
+        seed_val_t = torch.from_numpy(snap["seed_val"]).to(dtype=torch.float32).clamp(0.0, 1.0)
+        r0[seed_idx_t] = seed_val_t
+        wm_node[seed_idx_t] = seed_val_t
+
+    out["r0_nodes"] = r0.detach().cpu().numpy().astype(np.float32)
+    out["wm_node"] = wm_node.detach().cpu().numpy().astype(np.float32)
+    out["r0_grid"] = _node_values_to_grid(cache_slice.node_rc, out["r0_nodes"], pch_slice.shape, fill_value=np.nan)
+    out["r_node_history"] = {}
+    out["r_node_grids"] = {}
+    out["r_nodes_final"] = np.zeros((node_n,), dtype=np.float32)
+    out["r_nodes_grid_final"] = _node_values_to_grid(cache_slice.node_rc, out["r_nodes_final"], pch_slice.shape, fill_value=np.nan)
+
+    if snap["seed_idx"].size == 0:
+        out["fallback_reason"] = "no_snapped_seed"
+        return out
+
+    final_nodes_np, history_np = _graph_diffuse_with_history(
+        r0_flat=r0,
+        well_mask_flat=wm_node,
+        src=terms_t["src"],
+        dst=terms_t["dst"],
+        w=terms_t["w"],
+        steps=int(cfg["steps_r"]),
+        eta=float(cfg["eta"]),
+        well_soft_alpha=float(cfg["well_soft_alpha"]),
+        eps=1e-8,
+        capture_steps=out["capture_steps"],
+    )
+    out["r_nodes_final"] = final_nodes_np
+    out["r_node_history"] = history_np
+    out["r_node_grids"] = {
+        step: _node_values_to_grid(cache_slice.node_rc, values, pch_slice.shape, fill_value=np.nan)
+        for step, values in history_np.items()
+    }
+    out["r_nodes_grid_final"] = _node_values_to_grid(cache_slice.node_rc, final_nodes_np, pch_slice.shape, fill_value=np.nan)
+
+    r_grid_pre = lift_nodes_to_grid_cached(
+        r_nodes=final_nodes_np,
+        lift_nearest_idx=cache_slice.lift_nearest_idx,
+        lift_dist=cache_slice.lift_dist,
+        lift_sigma=float(cfg["agpe_lift_sigma"]),
+    ).astype(np.float32, copy=False)
+    r_grid_post = apply_well_constraint(
+        torch.from_numpy(r_grid_pre.copy()),
+        wm_t,
+        float(cfg["well_soft_alpha"]),
+    ).detach().cpu().numpy().astype(np.float32)
+    if float(cfg["agpe_lift_sigma"]) > 0.0:
+        lift_decay = np.exp(-cache_slice.lift_dist / float(cfg["agpe_lift_sigma"])).astype(np.float32)
+    else:
+        lift_decay = np.ones_like(cache_slice.lift_dist, dtype=np.float32)
+
+    out["lift_nearest_idx"] = cache_slice.lift_nearest_idx.astype(np.int32, copy=False)
+    out["lift_dist"] = cache_slice.lift_dist.astype(np.float32, copy=False)
+    out["lift_decay"] = lift_decay
+    out["r_grid_pre"] = r_grid_pre
+    out["r_grid_post"] = r_grid_post
+    out["r_grid_delta"] = (r_grid_post - r_grid_pre).astype(np.float32, copy=False)
+    return out
+
+
 def _crop(arr: np.ndarray, center_il: int, center_xl: int, radius: int) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     il0 = max(0, center_il - radius)
     il1 = min(arr.shape[0], center_il + radius + 1)
@@ -286,8 +661,15 @@ def prepare_bundle(cfg: dict) -> dict:
     _ensure_repo_import(repo_root)
     torch = _require_torch()
 
-    from utils.agpe_graph import compute_lattice_edge_weight, get_lattice_edges
+    from utils.agpe_graph import (
+        build_cache_for_slice,
+        compute_edge_weight_terms,
+        compute_lattice_edge_weight,
+        get_lattice_edges,
+        lift_nodes_to_grid_cached,
+    )
     from utils.reliability_aniso import (
+        _apply_well_constraint,
         anisotropic_reliability_2d,
         graph_lattice_reliability_2d,
         structure_tensor_orientation_and_strength,
@@ -352,6 +734,20 @@ def prepare_bundle(cfg: dict) -> dict:
     v_t, strength_t = structure_tensor_orientation_and_strength(x, sigma=float(cfg["sigma_st"]))
     v_slice = v_t[0].detach().cpu().numpy()
     strength_slice = strength_t[0, 0].detach().cpu().numpy()
+    skeleton_debug = _collect_skeleton_slice_debug(
+        cfg=cfg,
+        torch=torch,
+        pch_slice=pch_slice,
+        conf_slice=conf_slice,
+        feat_slice=feat_slice,
+        v_slice=v_slice,
+        strength_slice=strength_slice,
+        well_mask_2d=well_mask_2d,
+        build_cache_for_slice=build_cache_for_slice,
+        compute_edge_weight_terms=compute_edge_weight_terms,
+        lift_nodes_to_grid_cached=lift_nodes_to_grid_cached,
+        apply_well_constraint=_apply_well_constraint,
+    )
 
     src, dst = get_lattice_edges(il=il, xl=xl, diag=True, device=torch.device("cpu"))
     v_flat = torch.from_numpy(np.moveaxis(v_slice, 0, -1).reshape(-1, 2).astype(np.float32))
@@ -444,6 +840,24 @@ def prepare_bundle(cfg: dict) -> dict:
                 use_tensor_strength=bool(cfg["use_tensor_strength"]),
                 tensor_strength_power=float(cfg["tensor_strength_power"]),
             )
+        elif str(cfg["backend"]) == "skeleton_graph":
+            if skeleton_debug.get("cache_available", False) and skeleton_debug.get("fallback_reason") is None:
+                r_out = torch.from_numpy(skeleton_debug["r_grid_post"][None, None].astype(np.float32))
+            else:
+                r_out, _ = graph_lattice_reliability_2d(
+                    wm,
+                    pc,
+                    fk,
+                    steps=int(cfg["steps_r"]),
+                    eta=float(cfg["eta"]),
+                    gamma=float(cfg["gamma"]),
+                    tau=float(cfg["tau"]),
+                    kappa=float(cfg["kappa"]),
+                    sigma_st=float(cfg["sigma_st"]),
+                    well_soft_alpha=float(cfg["well_soft_alpha"]),
+                    use_tensor_strength=bool(cfg["use_tensor_strength"]),
+                    tensor_strength_power=float(cfg["tensor_strength_power"]),
+                )
         else:
             raise ValueError(f"Unsupported backend={cfg['backend']} for slice visualization")
         r_slice = r_out[0, 0].detach().cpu().numpy()
@@ -493,6 +907,7 @@ def prepare_bundle(cfg: dict) -> dict:
         "strength_slice": strength_slice,
         "incoming_weight_map": incoming_weight_map,
         "local_maps": local_maps,
+        "skeleton_debug": skeleton_debug,
         "r_slice": r_slice,
         "amp_crop": amp_crop,
         "gmag_crop": gmag_crop,
@@ -722,6 +1137,306 @@ def plot_local(bundle: dict) -> None:
     plt.show()
 
 
+def _get_edge_segments(node_rc: np.ndarray, src_idx: np.ndarray, dst_idx: np.ndarray, max_edges: int) -> tuple[np.ndarray, np.ndarray]:
+    edge_n = int(src_idx.shape[0])
+    if edge_n <= 0:
+        return np.empty((0, 2, 2), dtype=np.float32), np.empty((0,), dtype=np.int64)
+    if max_edges > 0 and edge_n > max_edges:
+        sel = np.linspace(0, edge_n - 1, max_edges, dtype=np.int64)
+    else:
+        sel = np.arange(edge_n, dtype=np.int64)
+    src_sel = src_idx[sel].astype(np.int64, copy=False)
+    dst_sel = dst_idx[sel].astype(np.int64, copy=False)
+    segments = np.stack(
+        [
+            np.column_stack([node_rc[src_sel, 1], node_rc[src_sel, 0]]),
+            np.column_stack([node_rc[dst_sel, 1], node_rc[dst_sel, 0]]),
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+    return segments, sel
+
+
+def _plot_edge_term_panel(
+    *,
+    fig,
+    ax,
+    background: np.ndarray,
+    node_rc: np.ndarray,
+    src_idx: np.ndarray,
+    dst_idx: np.ndarray,
+    values: np.ndarray,
+    title: str,
+    max_edges: int,
+    cmap: str = "viridis",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    wells: list[dict] | None = None,
+) -> None:
+    ax.imshow(background, cmap="gray_r", vmin=0.0, vmax=1.0, origin="upper")
+    segments, sel = _get_edge_segments(node_rc, src_idx, dst_idx, max_edges=max_edges)
+    if segments.shape[0] > 0:
+        values_sel = np.asarray(values, dtype=np.float32).reshape(-1)[sel]
+        if vmin is None or vmax is None:
+            vmin, vmax = _percentile_limits(values_sel, pct=(2.0, 98.0), symmetric=False)
+        lc = LineCollection(segments, cmap=cmap, linewidths=1.2, alpha=0.95)
+        lc.set_array(values_sel)
+        lc.set_clim(vmin, vmax)
+        ax.add_collection(lc)
+        fig.colorbar(lc, ax=ax, fraction=0.046, pad=0.04)
+    ax.scatter(node_rc[:, 1], node_rc[:, 0], s=5, c="white", linewidths=0.0, alpha=0.85)
+    if wells is not None:
+        ax.scatter([w["xline"] for w in wells], [w["inline"] for w in wells], s=18, c="black", marker="+", linewidths=0.8)
+    ax.set_title(title)
+    ax.set_xlabel("Xline")
+    ax.set_ylabel("Inline")
+
+
+def plot_skeleton_mask_extraction(bundle: dict) -> None:
+    cfg = bundle["cfg"]
+    dbg = bundle["skeleton_debug"]
+    p_vmin, p_vmax = 0.0, 1.0
+    amp_vmin, amp_vmax = bundle["amp_limits"]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.0), dpi=int(cfg["fig_dpi"]))
+    panels = [
+        (bundle["pch_slice"], "final p_channel", "turbo", p_vmin, p_vmax),
+        (bundle["conf_slice"], "conf", "viridis", p_vmin, p_vmax),
+        (dbg["mask"].astype(np.float32), f"channel-like mask\np_channel >= {cfg['agpe_skel_p_thresh']:.2f} and conf > 0", "gray_r", 0.0, 1.0),
+        (bundle["amp_slice"], "amp with mask contour", "seismic", amp_vmin, amp_vmax),
+        (bundle["pch_slice"], "p_channel with mask contour", "gray_r", p_vmin, p_vmax),
+        (dbg["mask"].astype(np.float32), "mask + wells", "gray_r", 0.0, 1.0),
+    ]
+    for idx, (ax, (arr, title, cmap, vmin, vmax)) in enumerate(zip(axes.ravel(), panels)):
+        im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
+        if idx in (3, 4):
+            ax.contour(dbg["mask"].astype(np.float32), levels=[0.5], colors=["gold"], linewidths=1.0)
+        ax.scatter([w["xline"] for w in bundle["wells"]], [w["inline"] for w in bundle["wells"]], s=18, c="white", edgecolors="black", linewidths=0.4)
+        ax.scatter(bundle["anchor_xl"], bundle["anchor_il"], s=85, c="gold", edgecolors="black", linewidths=1.0, marker="*")
+        ax.set_title(title)
+        ax.set_xlabel("Xline")
+        ax.set_ylabel("Inline")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle("1. Channel-like mask extraction from gated p_channel", fontsize=14)
+    _finalize_figure(fig, top=0.92)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_01_mask")
+    plt.show()
+
+
+def plot_skeleton_extraction(bundle: dict) -> None:
+    cfg = bundle["cfg"]
+    dbg = bundle["skeleton_debug"]
+    if not dbg.get("cache_available", False):
+        print("Skeleton extraction skipped: no valid skeleton graph could be built for the focus slice.")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 11.0), dpi=int(cfg["fig_dpi"]))
+    panels = [
+        (dbg["mask"].astype(np.float32), "channel-like mask", "gray_r", 0.0, 1.0),
+        (dbg["skel_mask"].astype(np.float32), "skeleton extraction skel_mask", "gray_r", 0.0, 1.0),
+        (bundle["pch_slice"], "p_channel + skeleton overlay", "gray_r", 0.0, 1.0),
+        (dbg["degree_maps"]["total"], "skeleton node total degree", "viridis", None, None),
+    ]
+    for idx, (ax, (arr, title, cmap, vmin, vmax)) in enumerate(zip(axes.ravel(), panels)):
+        if vmin is None or vmax is None:
+            vmin, vmax = _percentile_limits(arr[np.isfinite(arr)], pct=(0.0, 100.0), symmetric=False)
+        im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
+        if idx == 2:
+            ax.contour(dbg["skel_mask"].astype(np.float32), levels=[0.5], colors=["cyan"], linewidths=1.0)
+            ax.scatter(dbg["node_rc"][:, 1], dbg["node_rc"][:, 0], s=5, c="gold", linewidths=0.0)
+        ax.set_title(title)
+        ax.set_xlabel("Xline")
+        ax.set_ylabel("Inline")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle(
+        f"2. Skeleton extraction | n_nodes={dbg['n_nodes']} | n_edges={dbg['n_edges']} | n_long_edges={dbg['n_long_edges']}",
+        fontsize=14,
+    )
+    _finalize_figure(fig, top=0.92)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_02_extract")
+    plt.show()
+
+
+def plot_skeleton_graph_construction(bundle: dict) -> None:
+    cfg = bundle["cfg"]
+    dbg = bundle["skeleton_debug"]
+    if not dbg.get("cache_available", False):
+        print("Skeleton graph construction skipped: no valid skeleton graph could be built for the focus slice.")
+        return
+
+    node_rc = dbg["node_rc"]
+    fig, axes = plt.subplots(1, 3, figsize=(17.0, 5.5), dpi=int(cfg["fig_dpi"]))
+    panels = [
+        (dbg["edge_count_maps"]["local_in"], "local edge incidence on graph nodes", "viridis"),
+        (dbg["edge_count_maps"]["long_in"], "long-edge incidence on graph nodes", "magma"),
+        (dbg["degree_maps"]["total"], "node degree on graph", "plasma"),
+    ]
+    for ax, (arr, title, cmap) in zip(axes, panels):
+        ax.imshow(bundle["pch_slice"], cmap="gray_r", vmin=0.0, vmax=1.0, origin="upper")
+        valid = np.isfinite(arr)
+        if np.any(valid):
+            rows, cols = np.where(valid)
+            vals = arr[valid]
+            sc = ax.scatter(cols, rows, c=vals, s=18, cmap=cmap, linewidths=0.0, alpha=0.95)
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        ax.contour(dbg["skel_mask"].astype(np.float32), levels=[0.5], colors=["white"], linewidths=0.7, alpha=0.8)
+        ax.set_title(title)
+        ax.set_xlabel("Xline")
+        ax.set_ylabel("Inline")
+
+    fig.suptitle("3. Skeleton graph construction", fontsize=14)
+    _finalize_figure(fig, top=0.90)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_03_graph")
+    plt.show()
+
+
+def plot_seed_snapping(bundle: dict) -> None:
+    cfg = bundle["cfg"]
+    dbg = bundle["skeleton_debug"]
+    if not dbg.get("cache_available", False):
+        print("Seed snapping skipped: no valid skeleton graph could be built for the focus slice.")
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(16.8, 5.4), dpi=int(cfg["fig_dpi"]))
+    base = bundle["pch_slice"]
+    for ax in axes:
+        ax.imshow(base, cmap="gray_r", vmin=0.0, vmax=1.0, origin="upper")
+        ax.contour(dbg["skel_mask"].astype(np.float32), levels=[0.5], colors=["white"], linewidths=0.7, alpha=0.7)
+        ax.set_xlabel("Xline")
+        ax.set_ylabel("Inline")
+
+    raw_rc = dbg["raw_seed_rc"]
+    if raw_rc.size > 0:
+        axes[0].scatter(raw_rc[:, 1], raw_rc[:, 0], s=36, c="deepskyblue", edgecolors="black", linewidths=0.5)
+    axes[0].set_title("raw well seeds on slice")
+
+    snapped_rc = dbg["snapped_seed_rc"]
+    if snapped_rc.size > 0:
+        axes[1].scatter(snapped_rc[:, 1], snapped_rc[:, 0], s=46, c="gold", edgecolors="black", linewidths=0.5)
+    axes[1].set_title("unique snapped graph nodes")
+
+    if raw_rc.size > 0:
+        axes[2].scatter(raw_rc[:, 1], raw_rc[:, 0], s=26, c="deepskyblue", edgecolors="black", linewidths=0.4, label="raw well seed")
+    if snapped_rc.size > 0:
+        axes[2].scatter(snapped_rc[:, 1], snapped_rc[:, 0], s=42, c="gold", edgecolors="black", linewidths=0.5, label="snapped node")
+    for rec in dbg["snapped_records"]:
+        raw_r, raw_c = rec["raw_rc"]
+        snap_r, snap_c = rec["snap_rc"]
+        axes[2].plot([raw_c, snap_c], [raw_r, snap_r], color="orange", linewidth=0.9, alpha=0.8)
+    if dbg["failed_records"]:
+        fail_rc = np.asarray([rec["raw_rc"] for rec in dbg["failed_records"]], dtype=np.int32)
+        axes[2].scatter(fail_rc[:, 1], fail_rc[:, 0], s=38, c="red", marker="x", linewidths=1.0, label="failed snap")
+    axes[2].legend(loc="best")
+    axes[2].set_title(f"seed snapping to graph | snap_ok={dbg['snap_ok']} / {dbg['seed_total']}")
+
+    fig.suptitle("4. Well seed snapping to graph", fontsize=14)
+    _finalize_figure(fig, top=0.90)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_04_snapping")
+    plt.show()
+
+
+def plot_anisotropic_graph_diffusion(bundle: dict) -> None:
+    cfg = bundle["cfg"]
+    dbg = bundle["skeleton_debug"]
+    if not dbg.get("cache_available", False):
+        print("Anisotropic graph diffusion skipped: no valid skeleton graph could be built for the focus slice.")
+        return
+
+    node_rc = dbg["node_rc"]
+    term_names = [
+        ("g", "gate g"),
+        ("a", "orientation affinity a"),
+        ("s", "feature similarity s"),
+        ("p_edge", "channel/conf continuity p_edge"),
+        ("w", "combined weight w"),
+    ]
+
+    fig, axes = plt.subplots(1, len(term_names), figsize=(4.1 * len(term_names), 4.8), dpi=int(cfg["fig_dpi"]))
+    axes = np.atleast_1d(axes)
+    for ax, (name, title) in zip(axes, term_names):
+        ax.imshow(bundle["pch_slice"], cmap="gray_r", vmin=0.0, vmax=1.0, origin="upper")
+        arr = dbg["edge_node_means"][name]
+        valid = np.isfinite(arr)
+        if np.any(valid):
+            rows, cols = np.where(valid)
+            vals = arr[valid]
+            sc = ax.scatter(cols, rows, c=vals, s=18, cmap="viridis", linewidths=0.0, alpha=0.95)
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        ax.contour(dbg["skel_mask"].astype(np.float32), levels=[0.5], colors=["white"], linewidths=0.6, alpha=0.7)
+        ax.scatter(node_rc[:, 1], node_rc[:, 0], s=4, c="white", linewidths=0.0, alpha=0.4)
+        ax.set_title(title)
+        ax.set_xlabel("Xline")
+        ax.set_ylabel("Inline")
+    fig.suptitle("5. Anisotropic graph diffusion | edge-weight decomposition", fontsize=14)
+    _finalize_figure(fig, top=0.88)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_05_edge_terms")
+    plt.show()
+
+    capture_steps = dbg["capture_steps"]
+    ncols = len(capture_steps)
+    fig, axes = plt.subplots(1, ncols, figsize=(4.0 * ncols, 4.8), dpi=int(cfg["fig_dpi"]))
+    axes = np.atleast_1d(axes)
+    for ax, step in zip(axes, capture_steps):
+        ax.imshow(bundle["pch_slice"], cmap="gray_r", vmin=0.0, vmax=1.0, origin="upper")
+        grid = dbg["r_node_grids"].get(step)
+        if grid is not None:
+            node_mask = np.isfinite(grid)
+            if np.any(node_mask):
+                rows, cols = np.where(node_mask)
+                vals = grid[node_mask]
+                sc = ax.scatter(cols, rows, c=vals, s=18, cmap="turbo", vmin=0.0, vmax=1.0, linewidths=0.0)
+                fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        ax.contour(dbg["skel_mask"].astype(np.float32), levels=[0.5], colors=["white"], linewidths=0.6, alpha=0.7)
+        ax.set_title(f"node reliability on graph | step={step}")
+        ax.set_xlabel("Xline")
+        ax.set_ylabel("Inline")
+    fig.suptitle(
+        f"5. Anisotropic graph diffusion | node states | fallback={dbg.get('fallback_reason')}",
+        fontsize=14,
+    )
+    _finalize_figure(fig, top=0.88)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_05_node_history")
+    plt.show()
+
+
+def plot_lift_back_and_slice_stack(bundle: dict) -> None:
+    cfg = bundle["cfg"]
+    dbg = bundle["skeleton_debug"]
+    if not dbg.get("cache_available", False) or dbg.get("fallback_reason") is not None:
+        print("Lift-back visualization skipped: skeleton graph was not usable for slice diffusion on the focus depth.")
+        return
+
+    nearest_mod = np.where(dbg["lift_nearest_idx"] >= 0, dbg["lift_nearest_idx"] % 20, np.nan).astype(np.float32)
+    fig, axes = plt.subplots(2, 3, figsize=(16.0, 10.5), dpi=int(cfg["fig_dpi"]))
+    panels = [
+        (nearest_mod, "nearest skeleton node id mod 20", "tab20", None, None),
+        (dbg["lift_dist"], "lift distance to skeleton", "magma", None, None),
+        (dbg["lift_decay"], "lift decay exp(-dist / lift_sigma)", "viridis", 0.0, 1.0),
+        (dbg["r_grid_pre"], "lift-back to slice before well constraint", "turbo", 0.0, 1.0),
+        (dbg["r_grid_post"], "slice reliability after well constraint", "turbo", 0.0, 1.0),
+        (dbg["r_grid_delta"], "well-constraint delta", "coolwarm", None, None),
+    ]
+    for ax, (arr, title, cmap, vmin, vmax) in zip(axes.ravel(), panels):
+        if vmin is None or vmax is None:
+            finite = arr[np.isfinite(arr)]
+            if finite.size == 0:
+                vmin, vmax = 0.0, 1.0
+            elif title == "well-constraint delta":
+                vmin, vmax = _percentile_limits(finite, pct=(1.0, 99.0), symmetric=True)
+            else:
+                vmin, vmax = _percentile_limits(finite, pct=(1.0, 99.0), symmetric=False)
+        im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
+        ax.scatter([w["xline"] for w in bundle["wells"]], [w["inline"] for w in bundle["wells"]], s=18, c="white", edgecolors="black", linewidths=0.4)
+        ax.set_title(title)
+        ax.set_xlabel("Xline")
+        ax.set_ylabel("Inline")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle("6. Lift-back to slice from graph nodes", fontsize=14)
+    _finalize_figure(fig, top=0.92)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_06_lift_back")
+    plt.show()
+
+
 def plot_traces(bundle: dict, r_cube: np.ndarray | None = None) -> None:
     cfg = bundle["cfg"]
     ai = bundle["anchor_il"]
@@ -761,7 +1476,7 @@ def plot_traces(bundle: dict, r_cube: np.ndarray | None = None) -> None:
     plt.show()
 
 
-def load_or_compute_full_r(bundle: dict) -> np.ndarray | None:
+def load_or_compute_full_r(bundle: dict) -> tuple[np.ndarray | None, object | None]:
     cfg = bundle["cfg"]
     torch = _require_torch()
     r3d_path = cfg.get("r3d_path", None)
@@ -769,44 +1484,62 @@ def load_or_compute_full_r(bundle: dict) -> np.ndarray | None:
         arr = np.load(Path(r3d_path))
         h, il, xl = bundle["shape"]
         if arr.shape == (h, il, xl):
-            return arr.astype(np.float32, copy=False)
+            return arr.astype(np.float32, copy=False), None
         if arr.shape == (il, xl, h):
-            return np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
+            return np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False), None
         raise ValueError(f"Unsupported R cube shape {arr.shape}; expected {(h, il, xl)} or {(il, xl, h)}")
 
     if not cfg.get("compute_full_r", False):
-        return None
+        return None, None
 
     from utils.reliability_aniso import build_R_and_prior_from_cube
 
     h, il, xl = bundle["shape"]
     ai_dummy = torch.zeros((h, il, xl), dtype=torch.float32)
     well_trace_indices = torch.tensor([w["trace_index"] for w in bundle["wells"]], dtype=torch.long)
-    r_flat, _ = build_R_and_prior_from_cube(
-        seismic_3d=torch.from_numpy(bundle["seismic_hilxl"].astype(np.float32)),
-        ai_3d=ai_dummy,
-        well_trace_indices=well_trace_indices,
-        facies_3d=torch.from_numpy(bundle["facies_hilxl"].astype(np.int64)),
-        facies_prob_3d=None if bundle["facies_prob_3d"] is None else torch.from_numpy(bundle["facies_prob_3d"].astype(np.float32)),
-        p_channel_3d=None if bundle["p_channel_input_3d"] is None else torch.from_numpy(bundle["p_channel_input_3d"].astype(np.float32)),
-        conf_3d=None if bundle["conf_input_3d"] is None else torch.from_numpy(bundle["conf_input_3d"].astype(np.float32)),
-        facies_prior_3d=None if bundle["facies_prior_3d"] is None else torch.from_numpy(bundle["facies_prior_3d"].astype(np.int64)),
-        channel_id=int(cfg["channel_id"]),
-        alpha_prior=float(cfg["alpha_prior"]),
-        conf_thresh=float(cfg["conf_thresh"]),
-        neutral_p=float(cfg["neutral_p"]),
-        steps_R=int(cfg["steps_r"]),
-        eta=float(cfg["eta"]),
-        gamma=float(cfg["gamma"]),
-        tau=float(cfg["tau"]),
-        kappa=float(cfg["kappa"]),
-        sigma_st=float(cfg["sigma_st"]),
-        backend=str(cfg["full_r_backend"]),
-        aniso_use_tensor_strength=bool(cfg["use_tensor_strength"]),
-        aniso_tensor_strength_power=float(cfg["tensor_strength_power"]),
-        use_soft_prior=False,
-    )
-    return r_flat.detach().cpu().numpy().T.reshape(h, il, xl).astype(np.float32, copy=False)
+    build_kwargs = {
+        "seismic_3d": torch.from_numpy(bundle["seismic_hilxl"].astype(np.float32)),
+        "ai_3d": ai_dummy,
+        "well_trace_indices": well_trace_indices,
+        "facies_3d": torch.from_numpy(bundle["facies_hilxl"].astype(np.int64)),
+        "facies_prob_3d": None if bundle["facies_prob_3d"] is None else torch.from_numpy(bundle["facies_prob_3d"].astype(np.float32)),
+        "p_channel_3d": None if bundle["p_channel_input_3d"] is None else torch.from_numpy(bundle["p_channel_input_3d"].astype(np.float32)),
+        "conf_3d": None if bundle["conf_input_3d"] is None else torch.from_numpy(bundle["conf_input_3d"].astype(np.float32)),
+        "facies_prior_3d": None if bundle["facies_prior_3d"] is None else torch.from_numpy(bundle["facies_prior_3d"].astype(np.int64)),
+        "channel_id": int(cfg["channel_id"]),
+        "alpha_prior": float(cfg["alpha_prior"]),
+        "conf_thresh": float(cfg["conf_thresh"]),
+        "neutral_p": float(cfg["neutral_p"]),
+        "steps_R": int(cfg["steps_r"]),
+        "eta": float(cfg["eta"]),
+        "gamma": float(cfg["gamma"]),
+        "tau": float(cfg["tau"]),
+        "kappa": float(cfg["kappa"]),
+        "sigma_st": float(cfg["sigma_st"]),
+        "backend": str(cfg["full_r_backend"]),
+        "aniso_use_tensor_strength": bool(cfg["use_tensor_strength"]),
+        "aniso_tensor_strength_power": float(cfg["tensor_strength_power"]),
+        "agpe_skel_p_thresh": float(cfg["agpe_skel_p_thresh"]),
+        "agpe_skel_min_nodes": int(cfg["agpe_skel_min_nodes"]),
+        "agpe_skel_snap_radius": int(cfg["agpe_skel_snap_radius"]),
+        "agpe_long_edges": bool(cfg["agpe_long_edges"]),
+        "agpe_long_max_step": int(cfg["agpe_long_max_step"]),
+        "agpe_long_step": int(cfg["agpe_long_step"]),
+        "agpe_long_cos_thresh": float(cfg["agpe_long_cos_thresh"]),
+        "agpe_long_weight": float(cfg["agpe_long_weight"]),
+        "agpe_edge_tau_p": float(cfg["agpe_edge_tau_p"]),
+        "agpe_lift_sigma": float(cfg["agpe_lift_sigma"]),
+        "agpe_well_soft_alpha": float(cfg["well_soft_alpha"]),
+        "use_soft_prior": False,
+    }
+
+    if str(cfg["full_r_backend"]) == "skeleton_graph":
+        r_flat, _, graph_cache = build_R_and_prior_from_cube(return_graph_cache=True, **build_kwargs)
+    else:
+        r_flat, _ = build_R_and_prior_from_cube(**build_kwargs)
+        graph_cache = None
+    r_cube = r_flat.detach().cpu().numpy().T.reshape(h, il, xl).astype(np.float32, copy=False)
+    return r_cube, graph_cache
 
 
 def plot_full_r(bundle: dict, r_cube: np.ndarray | None) -> None:
@@ -818,8 +1551,28 @@ def plot_full_r(bundle: dict, r_cube: np.ndarray | None) -> None:
     il_pick = bundle["anchor_il"]
     xl_pick = bundle["anchor_xl"]
     z_pick = bundle["focus_depth"]
+    depth_offsets = tuple(cfg.get("stack_depth_offsets", (-2, -1, 0, 1, 2)))
+    depth_picks = []
+    for offset in depth_offsets:
+        depth_picks.append(int(np.clip(z_pick + int(offset), 0, bundle["shape"][0] - 1)))
+    depth_picks = list(dict.fromkeys(depth_picks))
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), dpi=int(cfg["fig_dpi"]))
+    fig, axes = plt.subplots(1, len(depth_picks), figsize=(3.8 * len(depth_picks), 4.5), dpi=int(cfg["fig_dpi"]))
+    axes = np.atleast_1d(axes)
+    for ax, depth_idx in zip(axes, depth_picks):
+        im = ax.imshow(r_cube[depth_idx], cmap="turbo", vmin=0.0, vmax=1.0, origin="upper")
+        ax.scatter([w["xline"] for w in bundle["wells"]], [w["inline"] for w in bundle["wells"]], s=16, c="white", edgecolors="black", linewidths=0.4)
+        ax.scatter(xl_pick, il_pick, s=80, c="gold", edgecolors="black", linewidths=0.8, marker="*")
+        ax.set_title(f"R depth slice z={depth_idx}")
+        ax.set_xlabel("Xline")
+        ax.set_ylabel("Inline")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle("7. Stack to 3D reliability field R(x) | neighboring depth slices", fontsize=14)
+    _finalize_figure(fig, top=0.88)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_07_depth_stack")
+    plt.show()
+
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.8), dpi=int(cfg["fig_dpi"]))
     ims = [
         axes[0].imshow(r_cube[z_pick], cmap="turbo", vmin=0.0, vmax=1.0, origin="upper"),
         axes[1].imshow(r_cube[:, il_pick, :], cmap="turbo", vmin=0.0, vmax=1.0, origin="upper", aspect="auto"),
@@ -838,9 +1591,48 @@ def plot_full_r(bundle: dict, r_cube: np.ndarray | None) -> None:
     axes[2].set_ylabel("Depth index")
     for ax, im in zip(axes, ims):
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle("Optional full-cube reliability view", fontsize=14)
+    fig.suptitle("7. Stack to 3D reliability field R(x) | orthogonal sections", fontsize=14)
     _finalize_figure(fig, top=0.92)
-    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_full_r_views")
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_07_sections")
+    plt.show()
+
+    graph_cache = bundle.get("full_graph_cache")
+    if graph_cache is None or not getattr(graph_cache, "slices", None):
+        return
+
+    depth_axis = np.arange(bundle["shape"][0], dtype=np.int32)
+    n_nodes = np.full_like(depth_axis, np.nan, dtype=np.float32)
+    n_edges = np.full_like(depth_axis, np.nan, dtype=np.float32)
+    long_ratio = np.full_like(depth_axis, np.nan, dtype=np.float32)
+    snap_ok_ratio = np.full_like(depth_axis, np.nan, dtype=np.float32)
+    fallback = np.zeros_like(depth_axis, dtype=np.float32)
+    for depth_idx, cache_slice in graph_cache.slices.items():
+        if 0 <= int(depth_idx) < depth_axis.size:
+            n_nodes[int(depth_idx)] = float(cache_slice.n_nodes)
+            n_edges[int(depth_idx)] = float(cache_slice.n_edges)
+            long_ratio[int(depth_idx)] = float(cache_slice.n_long_edges) / max(float(cache_slice.n_edges), 1.0)
+            snap_ok_ratio[int(depth_idx)] = float(cache_slice.snap_ok) / max(float(cache_slice.snap_total), 1.0)
+            fallback[int(depth_idx)] = 1.0 if bool(cache_slice.fallback) else 0.0
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.8), dpi=int(cfg["fig_dpi"]), sharex=True)
+    series = [
+        (n_nodes, "n_nodes / slice", "#1f77b4"),
+        (n_edges, "n_edges / slice", "#d62728"),
+        (long_ratio, "long-edge ratio", "#2ca02c"),
+        (snap_ok_ratio, "snap-ok ratio", "#9467bd"),
+    ]
+    for ax, (values, title, color) in zip(axes.ravel(), series):
+        ax.plot(depth_axis, values, color=color, lw=1.3)
+        ax.axvline(z_pick, color="black", linestyle="--", linewidth=0.8)
+        ax.set_title(title)
+        ax.set_xlabel("Depth index")
+        ax.set_ylabel("value")
+    fig.suptitle(
+        f"7. Stack to 3D reliability field R(x) | skeleton-graph slice stats | backend={graph_cache.last_stats.get('backend', 'n/a')}",
+        fontsize=14,
+    )
+    _finalize_figure(fig, top=0.90)
+    _maybe_savefig(fig, cfg, f"depth{bundle['focus_depth']:03d}_skeleton_07_stats")
     plt.show()
 
 
@@ -850,7 +1642,14 @@ def run_all(cfg: dict | None = None) -> tuple[dict, np.ndarray | None]:
     print_summary(bundle)
     plot_overview(bundle)
     plot_local(bundle)
-    r_cube = load_or_compute_full_r(bundle)
+    plot_skeleton_mask_extraction(bundle)
+    plot_skeleton_extraction(bundle)
+    plot_skeleton_graph_construction(bundle)
+    plot_seed_snapping(bundle)
+    plot_anisotropic_graph_diffusion(bundle)
+    plot_lift_back_and_slice_stack(bundle)
+    r_cube, graph_cache = load_or_compute_full_r(bundle)
+    bundle["full_graph_cache"] = graph_cache
     plot_traces(bundle, r_cube=r_cube)
     plot_full_r(bundle, r_cube)
     return bundle, r_cube
