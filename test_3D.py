@@ -242,6 +242,15 @@ def _percentile_vminmax(arr: np.ndarray, p_low=1, p_high=99):
     return float(vmin), float(vmax)
 
 
+def _symmetric_abs_percentile_vlim(arr: np.ndarray, p_abs=99):
+    """Compute a symmetric residual color limit from abs-value percentiles."""
+    vmax = float(np.percentile(np.abs(arr), p_abs))
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = float(np.max(np.abs(arr))) if arr.size > 0 else 1.0
+    vmax = max(vmax, 1e-6)
+    return -vmax, vmax
+
+
 def get_data_raw(data_flag='Stanford_VI'):
     """
     Load raw data only (no standardization or cropping).
@@ -339,6 +348,8 @@ def show_stanford_vi(
 
     # Use robust color limits from ground truth percentiles.
     vmin, vmax = _percentile_vminmax(AI_act, 1, 99)
+    residual = AI_pred - AI_act
+    rvmin, rvmax = _symmetric_abs_percentile_vlim(residual, p_abs=99)
 
     # -------- Pred xline section --------
     xline_pick = int(np.clip(xline_pick, 0, XL - 1))
@@ -421,6 +432,73 @@ def show_stanford_vi(
         ax.set_title(f"Ground Truth | depth={z}", fontsize=20)
         plt.savefig(f"results/{out_prefix}_True_depth_{z}.png", bbox_inches='tight')
     plt.close()
+
+    # -------- Residual xline section --------
+    fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
+    im = ax.imshow(
+        residual[:, xline_pick, :].T,
+        cmap="RdBu_r",
+        vmin=rvmin,
+        vmax=rvmax,
+        extent=(0, il_dist, H, 0),
+    )
+    ax.xaxis.set_major_locator(MultipleLocator(1000))
+    ax.yaxis.set_major_locator(MultipleLocator(100))
+    ax.tick_params(axis="both", labelsize=18)
+    ax.set_aspect(80 / 10)
+    ax.set_xlabel("Distance (m)", fontsize=20)
+    ax.set_ylabel("Depth (m)", fontsize=20)
+    ax.set_title(f"Residual (Pred - True) | xline={xline_pick}", fontsize=20)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Residual", fontsize=18)
+    cbar.ax.tick_params(labelsize=16)
+    plt.savefig(f"results/{out_prefix}_Residual_xline_{xline_pick}.png", bbox_inches='tight')
+    plt.close()
+
+    # -------- Residual inline section --------
+    fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
+    im = ax.imshow(
+        residual[inline_pick, :, :].T,
+        cmap="RdBu_r",
+        vmin=rvmin,
+        vmax=rvmax,
+        extent=(0, xl_dist, H, 0),
+    )
+    ax.xaxis.set_major_locator(MultipleLocator(1000))
+    ax.yaxis.set_major_locator(MultipleLocator(100))
+    ax.tick_params(axis="both", labelsize=18)
+    ax.set_aspect(45 / 10)
+    ax.set_xlabel("Distance (m)", fontsize=20)
+    ax.set_ylabel("Depth (m)", fontsize=20)
+    ax.set_title(f"Residual (Pred - True) | inline={inline_pick}", fontsize=20)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Residual", fontsize=18)
+    cbar.ax.tick_params(labelsize=16)
+    plt.savefig(f"results/{out_prefix}_Residual_inline_{inline_pick}.png", bbox_inches='tight')
+    plt.close()
+
+    # -------- Residual depth slice --------
+    for z in depth_slices:
+        z = int(np.clip(z, 0, H - 1))
+        fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
+        im = ax.imshow(
+            residual[:, :, z],
+            cmap="RdBu_r",
+            vmin=rvmin,
+            vmax=rvmax,
+            extent=(0, xl_dist, 0, il_dist),
+        )
+        ax.xaxis.set_major_locator(MultipleLocator(1000))
+        ax.yaxis.set_major_locator(MultipleLocator(1000))
+        ax.tick_params(axis="both", labelsize=18)
+        ax.set_xlabel("x(m)", fontsize=20)
+        ax.set_ylabel("y(m)", fontsize=20)
+        ax.set_title(f"Residual (Pred - True) | depth={z}", fontsize=20)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Residual", fontsize=18)
+        cbar.ax.tick_params(labelsize=16)
+        plt.savefig(f"results/{out_prefix}_Residual_depth_{z}.png", bbox_inches='tight')
+        plt.close()
 
     # -------- Seismic xline section --------
     fig, ax = plt.subplots(figsize=(16, 8), dpi=400)
