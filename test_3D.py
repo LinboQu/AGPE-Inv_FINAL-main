@@ -4,7 +4,7 @@ test_3D.py (FINAL, drop-in replacement)
 Capabilities:
 1) Load Stanford VI / Fanny datasets.
 2) Load trained checkpoints and run full-volume inference.
-3) Report R2 / PCC / SSIM / PSNR / MSE / MAE / MedAE.
+3) Report R2 / PCC / SSIM / VIF / MSE / MAE / MedAE.
 4) Save visualizations to results/:
    - Pred/True xline=50, inline=100, depth slices 40/100/160
    - Seismic xline=50 and single-trace comparison
@@ -35,6 +35,7 @@ from model.geomorphology_classification import Facies_model_class
 from utils.utils import standardize
 from utils.datasets import SeismicDataset1D
 from utils.config_resolver import resolve_test_config, resolve_train_config
+from utils.metrics import compute_vif_mscale
 from utils.noise import apply_test_noise, build_noise_label
 
 from sklearn.metrics import r2_score
@@ -817,6 +818,11 @@ def test(test_p: dict) -> dict:
     dr = AI_act_np.max() - AI_act_np.min() + 1e-12
     ssim_score = ssim(AI_act_np.T, AI_pred_np.T, data_range=dr)
     print(f"  SSIM      : {ssim_score:.4f}")
+
+    # VIF (visual information fidelity), computed on the same 2D trace-depth image
+    # layout used for SSIM.
+    vif_score = compute_vif_mscale(AI_act_np.T, AI_pred_np.T)
+    print(f"  VIF       : {vif_score:.4f}")
     
     # MSE/MAE/MedAE
     mse = np.mean((AI_pred_np - AI_act_np) ** 2)
@@ -826,11 +832,6 @@ def test(test_p: dict) -> dict:
     print(f"  MAE       : {mae:.4f}")
     print(f"  MedAE     : {medae:.4f}")
     
-    # PSNR (peak signal-to-noise ratio).
-    dr_full = max(AI_act_np.max(), AI_pred_np.max()) - min(AI_act_np.min(), AI_pred_np.min()) + 1e-12
-    psnr = 20 * np.log10(dr_full) - 10 * np.log10(mse + 1e-12)
-    print(f"  PSNR      : {psnr:.4f} dB")
-
     metrics = {
         "run_id": run_id,
         "model_name": model_name,
@@ -844,10 +845,10 @@ def test(test_p: dict) -> dict:
         "pcc": float(pcc),
         "p_value": float(p_value),
         "ssim": float(ssim_score),
+        "vif": float(vif_score),
         "mse": float(mse),
         "mae": float(mae),
         "medae": float(medae),
-        "psnr": float(psnr),
         "pred_mean": float(AI_pred_np.mean()),
         "pred_std": float(AI_pred_np.std()),
         "pred_min": float(AI_pred_np.min()),

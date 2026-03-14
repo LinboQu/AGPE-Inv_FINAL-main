@@ -16,12 +16,7 @@ from torch.utils.data import DataLoader
 from setting import TCN1D_train_p
 from utils.utils import standardize
 from utils.datasets import SeismicDataset1D  # expects (seismic, model, traces)
-
-from model.tcn import TCN_IV_1D_C
-from model.CNN2Layer import VishalNet
-from model.M2M_LSTM import GRU_MM
-from model.Unet_1D import Unet_1D
-from model.Transformer import TransformerModel
+from utils.model_registry import resolve_inverse_model_class
 
 
 # -----------------------------
@@ -76,18 +71,7 @@ def get_data_raw_stanford_vi():
 
 
 def build_inverse_model(model_name: str, in_ch: int):
-    if model_name == "tcnc":
-        choice = TCN_IV_1D_C
-    elif model_name == "VishalNet":
-        choice = VishalNet
-    elif model_name == "GRU_MM":
-        choice = GRU_MM
-    elif model_name == "Unet_1D":
-        choice = Unet_1D
-    elif model_name == "Transformer":
-        choice = TransformerModel
-    else:
-        raise ValueError(f"Unknown model_name: {model_name}")
+    choice = resolve_inverse_model_class(model_name)
 
     # robust constructor
     try:

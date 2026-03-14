@@ -205,10 +205,10 @@ REPORT_METRIC_KEYS: List[str] = [
     "pcc",
     "p_value",
     "ssim",
+    "vif",
     "mse",
     "mae",
     "medae",
-    "psnr",
 ]
 
 

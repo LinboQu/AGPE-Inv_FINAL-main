@@ -31,11 +31,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from model.CNN2Layer import VishalNet
-from model.tcn import TCN_IV_1D_C
-from model.M2M_LSTM import GRU_MM
-from model.Unet_1D import Unet_1D
-from model.Transformer import TransformerModel
 from model.Forward import forward_model_0, forward_model_1, forward_model_2
 from model.geomorphology_classification import Facies_model_class
 
@@ -43,6 +38,7 @@ from setting import TCN1D_train_p, TRAIN_PROFILE
 from utils.utils import standardize
 from utils.datasets import SeismicDataset1D, SeismicDataset1D_SPF, SeismicDataset1D_SPF_WS
 from utils.config_resolver import resolve_train_config
+from utils.model_registry import resolve_inverse_model_class
 from utils.noise import apply_train_input_perturbation, normalize_snr_choices
 from utils.reliability_aniso import build_R_and_prior_from_cube
 
@@ -169,18 +165,7 @@ def train(train_p: dict):
     Forward_model = train_p["Forward_model"]
     Facies_model_C = train_p["Facies_model"]
 
-    if model_name == "tcnc":
-        choice_model = TCN_IV_1D_C
-    elif model_name == "VishalNet":
-        choice_model = VishalNet
-    elif model_name == "GRU_MM":
-        choice_model = GRU_MM
-    elif model_name == "Unet_1D":
-        choice_model = Unet_1D
-    elif model_name == "Transformer":
-        choice_model = TransformerModel
-    else:
-        raise ValueError(f"Unknown model_name: {model_name}")
+    choice_model = resolve_inverse_model_class(model_name)
 
     if Forward_model == "cnn":
         forward = forward_model_0

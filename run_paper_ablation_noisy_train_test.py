@@ -29,7 +29,7 @@ DEFAULT_TRAIN_SNRS = (0.0, 5.0, 15.0, 25.0, 35.0)
 DEFAULT_TEST_SNRS = (0.0, 5.0, 15.0, 25.0, 35.0)
 DEFAULT_TRAIN_NOISE_PROB = 1.0
 DEFAULT_NOISE_SEED = 2026
-DELTA_KEYS = ("r2", "pcc", "ssim", "mse", "mae", "medae", "psnr")
+DELTA_KEYS = ("r2", "pcc", "ssim", "vif", "mse", "mae", "medae")
 REPEAT_SUMMARY_KEYS = ("noise_snr_db_measured",) + DELTA_KEYS
 
 
