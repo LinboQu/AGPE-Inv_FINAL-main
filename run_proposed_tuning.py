@@ -125,6 +125,37 @@ CLEAN_FULL_BASE: Dict[str, Any] = {
     "r_channel_dropout_prob": 0.0,
 }
 
+STAGE2_R01_BASE: Dict[str, Any] = {
+    **CURRENT_PROPOSED_BASE,
+    "train_noise_kind": "awgn",
+    "train_noise_prob": 0.30,
+    "train_noise_snr_db_choices": (30.0, 20.0),
+    "r_channel_dropout_prob": 0.15,
+}
+
+STAGE2_R02_BASE: Dict[str, Any] = {
+    **CURRENT_PROPOSED_BASE,
+    "train_noise_kind": "awgn",
+    "train_noise_prob": 0.20,
+    "train_noise_snr_db_choices": (35.0, 25.0),
+    "r_channel_dropout_prob": 0.10,
+}
+
+STAGE3_R02_WB_BASE: Dict[str, Any] = {
+    **STAGE2_R02_BASE,
+    "use_boundary_weight": True,
+    "boundary_weight_beta": 0.08,
+    "boundary_weight_width": 1,
+    "use_boundary_warm_schedule": True,
+    "boundary_beta_start": 0.0,
+    "boundary_beta_end": 0.08,
+    "boundary_warm_start_epoch": 500,
+    "boundary_warm_ramp_epochs": 300,
+    "boundary_weight_apply_ai": True,
+    "boundary_weight_apply_detail": False,
+    "boundary_weight_apply_facies": False,
+}
+
 
 @dataclass(frozen=True)
 class TrialSpec:
@@ -319,6 +350,143 @@ TRIAL_SPECS: Dict[str, TrialSpec] = {
         agpe_well_soft_alpha=0.10,
         aniso_closed_loop_conf_thresh=0.65,
     ),
+    "s2_r02_detail_soft": _trial(
+        stage="stage2",
+        group="anchor_r02",
+        name="s2_r02_detail_soft",
+        suffix="_ptune_s2_r02_dsoft",
+        base="anchor_r02",
+        note="Stage 2 primary branch: R02 anchor plus soft detail losses.",
+        lambda_depth_grad=0.002,
+        lambda_depth_hf=0.0004,
+    ),
+    "s2_r02_detail_mid": _trial(
+        stage="stage2",
+        group="anchor_r02",
+        name="s2_r02_detail_mid",
+        suffix="_ptune_s2_r02_dmid",
+        base="anchor_r02",
+        note="Stage 2 primary branch: R02 anchor plus mid-strength detail losses.",
+        lambda_depth_grad=0.005,
+        lambda_depth_hf=0.001,
+    ),
+    "s2_r02_detail_soft_anchor_up": _trial(
+        stage="stage2",
+        group="anchor_r02",
+        name="s2_r02_detail_soft_anchor_up",
+        suffix="_ptune_s2_r02_dsoft_aup",
+        base="anchor_r02",
+        note="Stage 2 primary branch: R02 anchor plus soft detail losses and a slightly stronger amplitude anchor.",
+        lambda_depth_grad=0.002,
+        lambda_depth_hf=0.0004,
+        lambda_amp_anchor=0.08,
+    ),
+    "s2_r02_weak_boundary": _trial(
+        stage="stage2",
+        group="anchor_r02",
+        name="s2_r02_weak_boundary",
+        suffix="_ptune_s2_r02_wbnd",
+        base="anchor_r02",
+        note="Stage 2 primary branch: R02 anchor plus a weak late AI-only boundary emphasis term.",
+        use_boundary_weight=True,
+        boundary_weight_beta=0.08,
+        boundary_weight_width=1,
+        use_boundary_warm_schedule=True,
+        boundary_beta_start=0.0,
+        boundary_beta_end=0.08,
+        boundary_warm_start_epoch=500,
+        boundary_warm_ramp_epochs=300,
+        boundary_weight_apply_ai=True,
+        boundary_weight_apply_detail=False,
+        boundary_weight_apply_facies=False,
+    ),
+    "s2_r02_conf_065": _trial(
+        stage="stage2",
+        group="anchor_r02",
+        name="s2_r02_conf_065",
+        suffix="_ptune_s2_r02_conf065",
+        base="anchor_r02",
+        note="Stage 2 primary branch: R02 anchor plus tighter closed-loop channel support.",
+        aniso_closed_loop_conf_thresh=0.65,
+    ),
+    "s2_r02_lift_sigma_20": _trial(
+        stage="stage2",
+        group="anchor_r02",
+        name="s2_r02_lift_sigma_20",
+        suffix="_ptune_s2_r02_lift20",
+        base="anchor_r02",
+        note="Stage 2 primary branch: R02 anchor plus tighter lift-back decay.",
+        agpe_lift_sigma=2.0,
+    ),
+    "s2_r01_detail_soft_balanced": _trial(
+        stage="stage2",
+        group="anchor_r01",
+        name="s2_r01_detail_soft_balanced",
+        suffix="_ptune_s2_r01_dsoft",
+        base="anchor_r01",
+        note="Stage 2 secondary branch: R01 anchor plus soft detail losses for a more balanced visual profile.",
+        lambda_depth_grad=0.002,
+        lambda_depth_hf=0.0004,
+    ),
+    "s3_r02_wb_lift20": _trial(
+        stage="stage3",
+        group="anchor_r02_wb",
+        name="s3_r02_wb_lift20",
+        suffix="_ptune_s3_r02_wb_lift20",
+        base="anchor_r02_wb",
+        note="Stage 3: R02 + weak boundary + tighter lift-back decay.",
+        agpe_lift_sigma=2.0,
+    ),
+    "s3_r02_wb_conf065": _trial(
+        stage="stage3",
+        group="anchor_r02_wb",
+        name="s3_r02_wb_conf065",
+        suffix="_ptune_s3_r02_wb_conf065",
+        base="anchor_r02_wb",
+        note="Stage 3: R02 + weak boundary + tighter closed-loop channel support.",
+        aniso_closed_loop_conf_thresh=0.65,
+    ),
+    "s3_r02_wb_detail_soft": _trial(
+        stage="stage3",
+        group="anchor_r02_wb",
+        name="s3_r02_wb_detail_soft",
+        suffix="_ptune_s3_r02_wb_dsoft",
+        base="anchor_r02_wb",
+        note="Stage 3: R02 + weak boundary + soft detail losses.",
+        lambda_depth_grad=0.002,
+        lambda_depth_hf=0.0004,
+    ),
+    "s3_r02_lift20_detail_soft": _trial(
+        stage="stage3",
+        group="anchor_r02",
+        name="s3_r02_lift20_detail_soft",
+        suffix="_ptune_s3_r02_lift20_dsoft",
+        base="anchor_r02",
+        note="Stage 3: R02 + tighter lift-back decay + soft detail losses.",
+        agpe_lift_sigma=2.0,
+        lambda_depth_grad=0.002,
+        lambda_depth_hf=0.0004,
+    ),
+    "s3_r02_wb_beta005": _trial(
+        stage="stage3",
+        group="anchor_r02_wb",
+        name="s3_r02_wb_beta005",
+        suffix="_ptune_s3_r02_wb_b005",
+        base="anchor_r02_wb",
+        note="Stage 3: R02 + weak boundary with slightly lighter beta=0.05.",
+        boundary_weight_beta=0.05,
+        boundary_beta_end=0.05,
+    ),
+    "s3_r02_wb_beta010": _trial(
+        stage="stage3",
+        group="anchor_r02_wb",
+        name="s3_r02_wb_beta010",
+        suffix="_ptune_s3_r02_wb_b010",
+        base="anchor_r02_wb",
+        note="Stage 3: R02 + weak boundary with slightly stronger beta=0.10.",
+        boundary_weight_beta=0.10,
+        boundary_beta_end=0.10,
+    ),
 }
 
 STAGE_ORDERS: Dict[str, List[str]] = {
@@ -340,8 +508,25 @@ STAGE_ORDERS: Dict[str, List[str]] = {
         "s1_a04_soft_alpha_010",
         "s1_c01_detail_soft_robust_light_tight",
     ],
+    "stage2": [
+        "s2_r02_detail_soft",
+        "s2_r02_detail_mid",
+        "s2_r02_detail_soft_anchor_up",
+        "s2_r02_weak_boundary",
+        "s2_r02_conf_065",
+        "s2_r02_lift_sigma_20",
+        "s2_r01_detail_soft_balanced",
+    ],
+    "stage3": [
+        "s3_r02_wb_lift20",
+        "s3_r02_wb_conf065",
+        "s3_r02_wb_detail_soft",
+        "s3_r02_lift20_detail_soft",
+        "s3_r02_wb_beta005",
+        "s3_r02_wb_beta010",
+    ],
 }
-STAGE_ORDERS["all"] = STAGE_ORDERS["stage0"] + STAGE_ORDERS["stage1"]
+STAGE_ORDERS["all"] = STAGE_ORDERS["stage0"] + STAGE_ORDERS["stage1"] + STAGE_ORDERS["stage2"] + STAGE_ORDERS["stage3"]
 
 
 def _jsonable(obj: Any) -> Any:
@@ -441,6 +626,12 @@ def _base_overrides_for_trial(spec: TrialSpec) -> dict[str, Any]:
         base = CURRENT_PROPOSED_BASE
     elif spec.base == "clean_full":
         base = CLEAN_FULL_BASE
+    elif spec.base == "anchor_r01":
+        base = STAGE2_R01_BASE
+    elif spec.base == "anchor_r02":
+        base = STAGE2_R02_BASE
+    elif spec.base == "anchor_r02_wb":
+        base = STAGE3_R02_WB_BASE
     else:
         raise ValueError(f"Unknown trial base: {spec.base}")
     out = copy.deepcopy(base)
@@ -774,43 +965,115 @@ def _safe_float(value: Any, default: float) -> float:
         return float(default)
 
 
+def _mean_metric(row: dict[str, Any], keys: tuple[str, ...], default: float) -> float:
+    values = [_safe_float(row.get(key), float("nan")) for key in keys]
+    finite = [v for v in values if np.isfinite(v)]
+    if not finite:
+        return float(default)
+    return float(np.mean(finite))
+
+
+def _augment_selection_fields(row: dict[str, Any]) -> None:
+    row["pred_std_ratio_err"] = abs(_safe_float(row.get("pred_std_ratio"), float("inf")) - 1.0)
+    row["lap_ratio_err"] = abs(_safe_float(row.get("lap_ratio"), float("inf")) - 1.0)
+    row["q01_gap_abs"] = abs(_safe_float(row.get("q01_gap"), float("inf")))
+    row["q99_gap_abs"] = abs(_safe_float(row.get("q99_gap"), float("inf")))
+    row["rep_slice_mae_mean"] = _mean_metric(
+        row,
+        ("depth100_mae", "inline100_mae", "xline50_mae"),
+        float("inf"),
+    )
+    row["rep_slice_ssim_mean"] = _mean_metric(
+        row,
+        ("depth100_ssim", "inline100_ssim", "xline50_ssim"),
+        float("-inf"),
+    )
+    row["rep_slice_vif_mean"] = _mean_metric(
+        row,
+        ("depth100_vif", "inline100_vif", "xline50_vif"),
+        float("-inf"),
+    )
+
+
 def _selection_sort_key(row: dict[str, Any]) -> tuple:
     mae_gate = int(row.get("mae_gate_ok", 0))
     ssim_score = _safe_float(row.get("ssim", float("-inf")), float("-inf"))
     vif_score = _safe_float(row.get("vif", float("-inf")), float("-inf"))
-    std_err = abs(_safe_float(row.get("pred_std_ratio", float("inf")), float("inf")) - 1.0)
-    lap_err = abs(_safe_float(row.get("lap_ratio", float("inf")), float("inf")) - 1.0)
+    rep_slice_ssim_mean = _safe_float(row.get("rep_slice_ssim_mean", float("-inf")), float("-inf"))
+    rep_slice_vif_mean = _safe_float(row.get("rep_slice_vif_mean", float("-inf")), float("-inf"))
+    depth100_ssim = _safe_float(row.get("depth100_ssim", float("-inf")), float("-inf"))
+    inline100_ssim = _safe_float(row.get("inline100_ssim", float("-inf")), float("-inf"))
+    xline50_ssim = _safe_float(row.get("xline50_ssim", float("-inf")), float("-inf"))
+    depth100_vif = _safe_float(row.get("depth100_vif", float("-inf")), float("-inf"))
+    inline100_vif = _safe_float(row.get("inline100_vif", float("-inf")), float("-inf"))
+    xline50_vif = _safe_float(row.get("xline50_vif", float("-inf")), float("-inf"))
+    rep_slice_mae_mean = _safe_float(row.get("rep_slice_mae_mean", float("inf")), float("inf"))
+    depth100_mae = _safe_float(row.get("depth100_mae", float("inf")), float("inf"))
+    inline100_mae = _safe_float(row.get("inline100_mae", float("inf")), float("inf"))
+    xline50_mae = _safe_float(row.get("xline50_mae", float("inf")), float("inf"))
+    std_err = _safe_float(row.get("pred_std_ratio_err", float("inf")), float("inf"))
+    lap_err = _safe_float(row.get("lap_ratio_err", float("inf")), float("inf"))
+    q01_gap_abs = _safe_float(row.get("q01_gap_abs", float("inf")), float("inf"))
+    q99_gap_abs = _safe_float(row.get("q99_gap_abs", float("inf")), float("inf"))
     mae = _safe_float(row.get("mae", float("inf")), float("inf"))
     medae = _safe_float(row.get("medae", float("inf")), float("inf"))
-    return (-mae_gate, -ssim_score, -vif_score, std_err, lap_err, mae, medae)
+    return (
+        -mae_gate,
+        -ssim_score,
+        -vif_score,
+        -rep_slice_ssim_mean,
+        -rep_slice_vif_mean,
+        -depth100_ssim,
+        -inline100_ssim,
+        -xline50_ssim,
+        -depth100_vif,
+        -inline100_vif,
+        -xline50_vif,
+        rep_slice_mae_mean,
+        depth100_mae,
+        inline100_mae,
+        xline50_mae,
+        std_err,
+        lap_err,
+        q01_gap_abs,
+        q99_gap_abs,
+        mae,
+        medae,
+    )
 
 
 def _rank_summary_rows(rows: list[dict[str, Any]], mae_tolerance: float, shortlist_k: int) -> list[dict[str, Any]]:
     ref_row = next((r for r in rows if r.get("trial_name") == "s0_ref_current_proposed" and "mae" in r), None)
-    if ref_row is None:
-        return rows
-    ref_mae = _safe_float(ref_row.get("mae"), float("inf"))
-    ref_ssim = _safe_float(ref_row.get("ssim"), float("nan"))
-    ref_vif = _safe_float(ref_row.get("vif"), float("nan"))
+    ref_mae = _safe_float(ref_row.get("mae"), float("inf")) if ref_row is not None else float("inf")
+    ref_ssim = _safe_float(ref_row.get("ssim"), float("nan")) if ref_row is not None else float("nan")
+    ref_vif = _safe_float(ref_row.get("vif"), float("nan")) if ref_row is not None else float("nan")
 
     metric_rows = [r for r in rows if "mae" in r]
     for row in metric_rows:
         mae = _safe_float(row.get("mae"), float("inf"))
-        row["mae_gate_ok"] = int(mae <= ref_mae * (1.0 + float(mae_tolerance)))
-        row["delta_mae_vs_ref"] = mae - ref_mae
-        row["delta_ssim_vs_ref"] = _safe_float(row.get("ssim"), float("nan")) - ref_ssim
-        row["delta_vif_vs_ref"] = _safe_float(row.get("vif"), float("nan")) - ref_vif
-        row["pred_std_ratio_err"] = abs(_safe_float(row.get("pred_std_ratio"), float("inf")) - 1.0)
-        row["lap_ratio_err"] = abs(_safe_float(row.get("lap_ratio"), float("inf")) - 1.0)
+        if ref_row is not None:
+            row["mae_gate_ok"] = int(mae <= ref_mae * (1.0 + float(mae_tolerance)))
+            row["delta_mae_vs_ref"] = mae - ref_mae
+            row["delta_ssim_vs_ref"] = _safe_float(row.get("ssim"), float("nan")) - ref_ssim
+            row["delta_vif_vs_ref"] = _safe_float(row.get("vif"), float("nan")) - ref_vif
+        else:
+            row["mae_gate_ok"] = 1
+            row["delta_mae_vs_ref"] = ""
+            row["delta_ssim_vs_ref"] = ""
+            row["delta_vif_vs_ref"] = ""
+        _augment_selection_fields(row)
 
     ranked_all = sorted(metric_rows, key=_selection_sort_key)
     for idx, row in enumerate(ranked_all, start=1):
         row["selection_rank_all"] = idx
 
-    stage1_rows = [r for r in ranked_all if r.get("stage") == "stage1"]
     shortlisted = set()
-    for idx, row in enumerate(stage1_rows, start=1):
-        row["selection_rank_stage1"] = idx
+    for stage_name in ("stage1", "stage2"):
+        stage_rows = [r for r in ranked_all if r.get("stage") == stage_name]
+        for idx, row in enumerate(stage_rows, start=1):
+            row[f"selection_rank_{stage_name}"] = idx
+
+    stage1_rows = [r for r in ranked_all if r.get("stage") == "stage1"]
     for row in stage1_rows[: max(int(shortlist_k), 0)]:
         row["shortlisted"] = 1
         shortlisted.add(str(row.get("trial_name")))
@@ -840,6 +1103,8 @@ def _export_ranked_run_outputs(
     run_root: Path,
     summary_rows: list[dict[str, Any]],
     trial_registry: list[dict[str, Any]],
+    shortlist_k: int,
+    visual_top_k: int,
 ) -> None:
     registry_map = {str(item["trial_name"]): Path(str(item["case_dir"])) for item in trial_registry}
 
@@ -853,6 +1118,7 @@ def _export_ranked_run_outputs(
     summary_csv = run_root / "trial_summary.csv"
     summary_xlsx = run_root / "trial_summary.xlsx"
     shortlist_json = run_root / "stage1_shortlist.json"
+    top_trials_json = run_root / "top_trials.json"
 
     _save_case_json(summary_json, {"rows": summary_rows})
     _save_metrics_csv(summary_csv, summary_rows)
@@ -872,9 +1138,56 @@ def _export_ranked_run_outputs(
         for row in summary_rows
         if int(row.get("shortlisted", 0)) == 1
     ]
+    stage1_shortlist = sorted(
+        stage1_shortlist,
+        key=lambda item: _safe_float(item.get("selection_rank_stage1"), float("inf")),
+    )
     _save_case_json(shortlist_json, {"shortlist": stage1_shortlist})
 
-    required = [summary_json, summary_csv, summary_xlsx, shortlist_json]
+    preferred_stage = None
+    for stage_name in ("stage2", "stage1"):
+        if any(r.get("stage") == stage_name and "mae" in r for r in summary_rows):
+            preferred_stage = stage_name
+            break
+    ranked_visual_rows = sorted(
+        [r for r in summary_rows if "mae" in r and str(r.get("stage")) == str(preferred_stage)],
+        key=_selection_sort_key,
+    )
+    top_trials = []
+    for row in ranked_visual_rows[: max(int(visual_top_k), 0)]:
+        trial_name = str(row.get("trial_name"))
+        case_dir = registry_map.get(trial_name)
+        stage_rank = row.get(f"selection_rank_{preferred_stage}", row.get("selection_rank_all"))
+        top_trials.append(
+            {
+                "trial_name": trial_name,
+                "case_dir": str(case_dir.resolve()) if case_dir is not None else "",
+                "case_name": case_dir.name if case_dir is not None else trial_name,
+                "stage": row.get("stage"),
+                "group": row.get("group"),
+                "selection_rank_stage": stage_rank,
+                "selection_rank_all": row.get("selection_rank_all"),
+                "display_label": f"Rank {stage_rank}: {trial_name}",
+                "mae": row.get("mae"),
+                "ssim": row.get("ssim"),
+                "vif": row.get("vif"),
+                "pred_std_ratio": row.get("pred_std_ratio"),
+                "lap_ratio": row.get("lap_ratio"),
+                "q01_gap_abs": row.get("q01_gap_abs"),
+                "q99_gap_abs": row.get("q99_gap_abs"),
+            }
+        )
+    _save_case_json(
+        top_trials_json,
+        {
+            "preferred_stage": preferred_stage,
+            "visual_top_k": int(visual_top_k),
+            "source_shortlist_k": int(shortlist_k),
+            "top_trials": top_trials,
+        },
+    )
+
+    required = [summary_json, summary_csv, summary_xlsx, shortlist_json, top_trials_json]
     missing = [p.as_posix() for p in required if not p.is_file()]
     if missing:
         raise RuntimeError(f"Missing expected run-summary exports: {missing}")
@@ -889,6 +1202,7 @@ def run_trials(
     dry_run: bool,
     shortlist_k: int,
     mae_tolerance: float,
+    visual_top_k: int,
 ) -> None:
     train = None
     test = None
@@ -913,6 +1227,7 @@ def run_trials(
         "dry_run": dry_run,
         "shortlist_k": shortlist_k,
         "mae_tolerance": mae_tolerance,
+        "visual_top_k": visual_top_k,
         "trial_names": trial_names,
     }
     _save_case_json(run_root / "run_meta.json", run_meta)
@@ -1015,20 +1330,83 @@ def run_trials(
         run_root=run_root,
         summary_rows=summary_rows,
         trial_registry=trial_registry,
+        shortlist_k=shortlist_k,
+        visual_top_k=visual_top_k,
     )
     print(f"[SAVE] summary -> {(run_root / 'trial_summary.xlsx').as_posix()}")
     print(f"[SAVE] shortlist -> {(run_root / 'stage1_shortlist.json').as_posix()}")
+    print(f"[SAVE] visual top trials -> {(run_root / 'top_trials.json').as_posix()}")
+
+
+def _load_case_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _discover_case_dirs(run_root: Path) -> list[Path]:
+    return [p for p in sorted(run_root.iterdir()) if p.is_dir() and p.name[:2].isdigit()]
+
+
+def postprocess_run_outputs(
+    *,
+    run_root: Path,
+    shortlist_k: int,
+    mae_tolerance: float,
+    visual_top_k: int,
+) -> None:
+    if not run_root.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_root}")
+
+    registry_payload = _load_case_json(run_root / "trial_registry.json")
+    if registry_payload is not None:
+        trial_registry = list(registry_payload.get("trials", []))
+    else:
+        trial_registry = []
+        for idx, case_dir in enumerate(_discover_case_dirs(run_root), start=1):
+            summary_row = _load_case_json(case_dir / "summary_row.json") or {}
+            trial_registry.append(
+                {
+                    "order": idx,
+                    "trial_name": summary_row.get("trial_name", case_dir.name),
+                    "stage": summary_row.get("stage", ""),
+                    "group": summary_row.get("group", ""),
+                    "case_dir": str(case_dir),
+                    "suffix": summary_row.get("run_id_suffix", ""),
+                    "note": summary_row.get("note", ""),
+                }
+            )
+
+    summary_rows: list[dict[str, Any]] = []
+    for item in trial_registry:
+        case_dir = Path(str(item["case_dir"]))
+        row = _load_case_json(case_dir / "summary_row.json")
+        if row is None:
+            raise FileNotFoundError(f"summary_row.json missing for case: {case_dir}")
+        summary_rows.append(row)
+
+    summary_rows = _rank_summary_rows(summary_rows, mae_tolerance=mae_tolerance, shortlist_k=shortlist_k)
+    _export_ranked_run_outputs(
+        run_root=run_root,
+        summary_rows=summary_rows,
+        trial_registry=trial_registry,
+        shortlist_k=shortlist_k,
+        visual_top_k=visual_top_k,
+    )
+    print(f"[POSTPROCESS] summary -> {(run_root / 'trial_summary.xlsx').as_posix()}")
+    print(f"[POSTPROCESS] shortlist -> {(run_root / 'stage1_shortlist.json').as_posix()}")
+    print(f"[POSTPROCESS] visual top trials -> {(run_root / 'top_trials.json').as_posix()}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Stage 0 + Stage 1 Proposed tuning experiments with metric and visual summaries."
+        description="Run Proposed tuning experiments with metric, visual, and shortlist summaries."
     )
     parser.add_argument(
         "--stage",
         type=str,
         default="all",
-        choices=["stage0", "stage1", "all"],
+        choices=["stage0", "stage1", "stage2", "stage3", "all"],
         help="Which stage set to run.",
     )
     parser.add_argument(
@@ -1069,6 +1447,18 @@ def parse_args() -> argparse.Namespace:
         help="MAE tolerance over the Stage 0 current Proposed reference for shortlist gating.",
     )
     parser.add_argument(
+        "--visual-top-k",
+        type=int,
+        default=5,
+        help="How many top tuning trials to export for direct notebook comparison.",
+    )
+    parser.add_argument(
+        "--postprocess-run-dir",
+        type=str,
+        default=None,
+        help="Existing proposed_tuning run directory to rerank and regenerate summary/shortlist/top-trial exports.",
+    )
+    parser.add_argument(
         "--list-trials",
         action="store_true",
         help="Print all available trial names and exit.",
@@ -1090,6 +1480,15 @@ def main() -> None:
             )
         return
 
+    if args.postprocess_run_dir:
+        postprocess_run_outputs(
+            run_root=Path(str(args.postprocess_run_dir)),
+            shortlist_k=int(args.shortlist_k),
+            mae_tolerance=float(args.mae_tolerance),
+            visual_top_k=int(args.visual_top_k),
+        )
+        return
+
     trial_names = _resolve_trial_order(stage=str(args.stage), explicit_trials=args.trials)
     run_trials(
         stage=str(args.stage),
@@ -1099,6 +1498,7 @@ def main() -> None:
         dry_run=bool(args.dry_run),
         shortlist_k=int(args.shortlist_k),
         mae_tolerance=float(args.mae_tolerance),
+        visual_top_k=int(args.visual_top_k),
     )
 
 
