@@ -547,6 +547,26 @@ def train(train_p: dict):
     region_pointbar_id = int(train_p.get("region_pointbar_id", 1))
     region_channel_weight = float(train_p.get("region_channel_weight", 1.0))
     region_pointbar_weight = float(train_p.get("region_pointbar_weight", 1.5))
+    lambda_facies_residual = float(train_p.get("lambda_facies_residual", 0.0))
+    facies_residual_mode = str(train_p.get("facies_residual_mode", "charbonnier")).strip().lower()
+    facies_residual_eps = float(train_p.get("facies_residual_eps", 1e-3))
+    facies_residual_huber_delta = float(train_p.get("facies_residual_huber_delta", 0.05))
+    facies_residual_background_weight = float(train_p.get("facies_residual_background_weight", 0.0))
+    facies_residual_channel_weight = float(train_p.get("facies_residual_channel_weight", 1.5))
+    facies_residual_pointbar_weight = float(train_p.get("facies_residual_pointbar_weight", 2.0))
+    lambda_boundary_band_residual = float(train_p.get("lambda_boundary_band_residual", 0.0))
+    lambda_boundary_band_grad = float(train_p.get("lambda_boundary_band_grad", 0.0))
+    boundary_band_mode = str(train_p.get("boundary_band_mode", "charbonnier")).strip().lower()
+    boundary_band_eps = float(train_p.get("boundary_band_eps", facies_residual_eps))
+    boundary_band_huber_delta = float(train_p.get("boundary_band_huber_delta", facies_residual_huber_delta))
+    boundary_band_width = int(train_p.get("boundary_band_width", 2))
+    lambda_masked_stat = float(train_p.get("lambda_masked_stat", 0.0))
+    masked_stat_channel_weight = float(train_p.get("masked_stat_channel_weight", 1.0))
+    masked_stat_pointbar_weight = float(train_p.get("masked_stat_pointbar_weight", 1.5))
+    masked_stat_eps = float(train_p.get("masked_stat_eps", 1e-6))
+    use_structural_warm_schedule = bool(train_p.get("use_structural_warm_schedule", False))
+    structural_warm_start_epoch = int(train_p.get("structural_warm_start_epoch", 500))
+    structural_warm_ramp_epochs = int(train_p.get("structural_warm_ramp_epochs", 250))
     # Depth-detail preservation to suppress over-layered smoothing.
     lambda_depth_grad = float(train_p.get("lambda_depth_grad", 0.20))
     lambda_depth_hf = float(train_p.get("lambda_depth_hf", 0.10))
@@ -596,6 +616,14 @@ def train(train_p: dict):
         f"[REGION-LOSS] lambda_res={lambda_region_residual:.4f} lambda_bias={lambda_region_bias:.4f} "
         f"norm={region_residual_norm} channel_id={region_channel_id} pointbar_id={region_pointbar_id} "
         f"channel_w={region_channel_weight:.3f} pointbar_w={region_pointbar_weight:.3f}"
+    )
+    print(
+        f"[STRUCT-LOSS] lambda_facies_res={lambda_facies_residual:.4f} mode={facies_residual_mode} "
+        f"bg_w={facies_residual_background_weight:.3f} ch_w={facies_residual_channel_weight:.3f} "
+        f"pb_w={facies_residual_pointbar_weight:.3f} lambda_bd_res={lambda_boundary_band_residual:.4f} "
+        f"lambda_bd_grad={lambda_boundary_band_grad:.4f} bd_mode={boundary_band_mode} bd_width={boundary_band_width} "
+        f"lambda_stat={lambda_masked_stat:.4f} warm={int(use_structural_warm_schedule)} "
+        f"start={structural_warm_start_epoch} ramp={structural_warm_ramp_epochs}"
     )
 
     optimizer = torch.optim.Adam(
@@ -690,6 +718,18 @@ def train(train_p: dict):
         warm = _linear_warm_factor(epoch, boundary_warm_start_epoch, boundary_warm_ramp_epochs)
         return float(boundary_beta_start) * (1.0 - warm) + float(boundary_beta_end) * warm
 
+    def _structural_loss_coeffs(epoch: int) -> tuple[float, float, float, float]:
+        if not bool(use_structural_warm_schedule):
+            warm = 1.0
+        else:
+            warm = _linear_warm_factor(epoch, structural_warm_start_epoch, structural_warm_ramp_epochs)
+        return (
+            float(lambda_facies_residual) * warm,
+            float(lambda_boundary_band_residual) * warm,
+            float(lambda_boundary_band_grad) * warm,
+            float(lambda_masked_stat) * warm,
+        )
+
     def _augment_inverse_input(
         x_clean: torch.Tensor,
         epoch: int,
@@ -732,6 +772,28 @@ def train(train_p: dict):
             return torch.mean((pred - target) ** 2)
         return torch.mean(torch.abs(pred - target))
 
+    def _robust_penalty(
+        err: torch.Tensor,
+        *,
+        mode: str,
+        eps: float,
+        huber_delta: float,
+    ) -> torch.Tensor:
+        abs_err = torch.abs(err)
+        if mode == "l2":
+            return err ** 2
+        if mode == "l1":
+            return abs_err
+        if mode == "charbonnier":
+            eps_t = max(float(eps), 1e-8)
+            return torch.sqrt((err ** 2) + (eps_t ** 2)) - eps_t
+        if mode == "huber":
+            delta = max(float(huber_delta), 1e-8)
+            quad = 0.5 * (abs_err ** 2) / delta
+            lin = abs_err - (0.5 * delta)
+            return torch.where(abs_err <= delta, quad, lin)
+        raise ValueError(f"Unsupported robust penalty mode: {mode}")
+
     def _facies_ce_map(logits: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
         return F.cross_entropy(logits, z_label, reduction="none", weight=facies_ce_weight)
 
@@ -770,6 +832,37 @@ def train(train_p: dict):
             w = w + (z2 == int(region_pointbar_id)).float() * float(region_pointbar_weight)
         return w
 
+    def _facies_residual_weight_map(z_label: torch.Tensor) -> torch.Tensor:
+        z2 = z_label.squeeze(1) if z_label.dim() == 3 else z_label
+        if z2.dim() != 2:
+            raise ValueError(f"Expected z_label dim=2/3, got shape={tuple(z_label.shape)}")
+        w = torch.full_like(z2, float(facies_residual_background_weight), dtype=torch.float32)
+        if float(facies_residual_channel_weight) != 0.0:
+            w = w + (z2 == int(region_channel_id)).float() * float(facies_residual_channel_weight)
+        if float(facies_residual_pointbar_weight) != 0.0:
+            w = w + (z2 == int(region_pointbar_id)).float() * float(facies_residual_pointbar_weight)
+        return w
+
+    def _target_boundary_band_mask(z_label: torch.Tensor) -> torch.Tensor:
+        z2 = z_label.squeeze(1) if z_label.dim() == 3 else z_label
+        if z2.dim() != 2:
+            raise ValueError(f"Expected z_label dim=2/3, got shape={tuple(z_label.shape)}")
+        if z2.shape[-1] < 2:
+            return torch.zeros_like(z2, dtype=torch.float32)
+        left = z2[:, :-1]
+        right = z2[:, 1:]
+        left_target = (left == int(region_channel_id)) | (left == int(region_pointbar_id))
+        right_target = (right == int(region_channel_id)) | (right == int(region_pointbar_id))
+        edge = (left != right) & (left_target | right_target)
+        band = torch.zeros_like(z2, dtype=torch.float32)
+        band[:, :-1] = torch.maximum(band[:, :-1], edge.float())
+        band[:, 1:] = torch.maximum(band[:, 1:], edge.float())
+        width = max(int(boundary_band_width), 0)
+        if width > 0:
+            k = 2 * width + 1
+            band = F.max_pool1d(band.unsqueeze(1), kernel_size=k, stride=1, padding=width).squeeze(1)
+        return band
+
     def _region_residual_loss(pred: torch.Tensor, target: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
         reg_w = _region_weight_map(z_label)
         if float(reg_w.sum().detach().item()) <= 0.0:
@@ -796,6 +889,80 @@ def train(train_p: dict):
                 continue
             cls_bias = torch.abs((res * mask).sum() / (mask.sum() + 1e-8))
             numer = numer + (cls_bias * float(cls_w))
+            denom = denom + float(cls_w)
+        if float(denom.detach().item()) <= 0.0:
+            return pred.new_zeros(())
+        return numer / (denom + 1e-8)
+
+    def _facies_residual_loss(pred: torch.Tensor, target: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
+        reg_w = _facies_residual_weight_map(z_label)
+        if float(reg_w.sum().detach().item()) <= 0.0:
+            return pred.new_zeros(())
+        pen = _robust_penalty(
+            pred - target,
+            mode=facies_residual_mode,
+            eps=facies_residual_eps,
+            huber_delta=facies_residual_huber_delta,
+        )
+        return (pen * reg_w.unsqueeze(1)).sum() / (reg_w.sum() + 1e-8)
+
+    def _boundary_band_residual_loss(pred: torch.Tensor, target: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
+        band = _target_boundary_band_mask(z_label)
+        if float(band.sum().detach().item()) <= 0.0:
+            return pred.new_zeros(())
+        pen = _robust_penalty(
+            pred - target,
+            mode=boundary_band_mode,
+            eps=boundary_band_eps,
+            huber_delta=boundary_band_huber_delta,
+        )
+        return (pen * band.unsqueeze(1)).sum() / (band.sum() + 1e-8)
+
+    def _boundary_band_grad_loss(pred: torch.Tensor, target: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
+        band = _target_boundary_band_mask(z_label)
+        if band.shape[-1] < 2 or float(band.sum().detach().item()) <= 0.0:
+            return pred.new_zeros(())
+        grad_w = torch.maximum(band[:, 1:], band[:, :-1]).unsqueeze(1)
+        pen = _robust_penalty(
+            _depth_diff(pred) - _depth_diff(target),
+            mode=boundary_band_mode,
+            eps=boundary_band_eps,
+            huber_delta=boundary_band_huber_delta,
+        )
+        return (pen * grad_w).sum() / (grad_w.sum() + 1e-8)
+
+    def _masked_mean_std_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        pred2 = pred.squeeze(1)
+        target2 = target.squeeze(1)
+        m = mask.to(dtype=pred2.dtype, device=pred2.device)
+        count = m.sum()
+        if float(count.detach().item()) <= 0.0:
+            return pred.new_zeros(())
+        pred_mean = (pred2 * m).sum() / (count + masked_stat_eps)
+        target_mean = (target2 * m).sum() / (count + masked_stat_eps)
+        loss = torch.abs(pred_mean - target_mean)
+        if float(count.detach().item()) > 1.0:
+            pred_var = (((pred2 - pred_mean) ** 2) * m).sum() / (count + masked_stat_eps)
+            target_var = (((target2 - target_mean) ** 2) * m).sum() / (count + masked_stat_eps)
+            pred_std = torch.sqrt(torch.clamp(pred_var, min=0.0) + masked_stat_eps)
+            target_std = torch.sqrt(torch.clamp(target_var, min=0.0) + masked_stat_eps)
+            loss = loss + torch.abs(pred_std - target_std)
+        return loss
+
+    def _masked_stat_loss(pred: torch.Tensor, target: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
+        z2 = z_label.squeeze(1) if z_label.dim() == 3 else z_label
+        numer = pred.new_zeros(())
+        denom = pred.new_zeros(())
+        for cls_id, cls_w in (
+            (int(region_channel_id), float(masked_stat_channel_weight)),
+            (int(region_pointbar_id), float(masked_stat_pointbar_weight)),
+        ):
+            if cls_w <= 0.0:
+                continue
+            mask = (z2 == cls_id).float()
+            if float(mask.sum().detach().item()) <= 0.0:
+                continue
+            numer = numer + (_masked_mean_std_loss(pred, target, mask) * float(cls_w))
             denom = denom + float(cls_w)
         if float(denom.detach().item()) <= 0.0:
             return pred.new_zeros(())
@@ -982,6 +1149,12 @@ def train(train_p: dict):
         fac_detach_t = _facies_detach_flag(epoch)
         lambda_depth_grad_t, lambda_depth_hf_t = _depth_loss_coeff(epoch)
         boundary_beta_t = _boundary_beta(epoch)
+        (
+            lambda_facies_residual_t,
+            lambda_boundary_band_residual_t,
+            lambda_boundary_band_grad_t,
+            lambda_masked_stat_t,
+        ) = _structural_loss_coeffs(epoch)
         if (
             epoch == 0
             or epoch == stageA_epochs
@@ -989,6 +1162,7 @@ def train(train_p: dict):
             or (use_late_multitask_decouple and epoch == late_multitask_start_epoch)
             or (use_depth_warm_schedule and epoch == depth_warm_start_epoch)
             or (use_boundary_warm_schedule and epoch == boundary_warm_start_epoch)
+            or (use_structural_warm_schedule and epoch == structural_warm_start_epoch)
         ):
             print(
                 f"[LOSS-SCHED] epoch={epoch} "
@@ -996,6 +1170,10 @@ def train(train_p: dict):
                 f"ws_every={ws_every_t} ws_max_batches={ws_cap_t} lambda_amp_anchor={lambda_amp_anchor:.4f} "
                 f"lambda_depth_grad={lambda_depth_grad_t:.4f} lambda_depth_hf={lambda_depth_hf_t:.4f} "
                 f"lambda_region_residual={lambda_region_residual:.4f} lambda_region_bias={lambda_region_bias:.4f} "
+                f"lambda_facies_residual={lambda_facies_residual_t:.4f} "
+                f"lambda_boundary_band_residual={lambda_boundary_band_residual_t:.4f} "
+                f"lambda_boundary_band_grad={lambda_boundary_band_grad_t:.4f} "
+                f"lambda_masked_stat={lambda_masked_stat_t:.4f} "
                 f"boundary_weight={int(use_boundary_weight)} beta={boundary_beta_t:.2f} width={boundary_weight_width} "
                 f"facies_detach={int(fac_detach_t)} late_decouple={int(_is_late_multitask(epoch))}"
             )
@@ -1085,12 +1263,24 @@ def train(train_p: dict):
             l_rec = criterion_rec(x_rec, x[:, 0:1, :])
             l_region_res = torch.tensor(0.0, device=device)
             l_region_bias = torch.tensor(0.0, device=device)
+            l_facies_res = torch.tensor(0.0, device=device)
+            l_bd_res = torch.tensor(0.0, device=device)
+            l_bd_grad = torch.tensor(0.0, device=device)
+            l_stat = torch.tensor(0.0, device=device)
             l_dgrad = torch.tensor(0.0, device=device)
             l_dhf = torch.tensor(0.0, device=device)
             if lambda_region_residual > 0:
                 l_region_res = _region_residual_loss(y_pred, y, z)
             if lambda_region_bias > 0:
                 l_region_bias = _region_bias_loss(y_pred, y, z)
+            if lambda_facies_residual_t > 0:
+                l_facies_res = _facies_residual_loss(y_pred, y, z)
+            if lambda_boundary_band_residual_t > 0:
+                l_bd_res = _boundary_band_residual_loss(y_pred, y, z)
+            if lambda_boundary_band_grad_t > 0:
+                l_bd_grad = _boundary_band_grad_loss(y_pred, y, z)
+            if lambda_masked_stat_t > 0:
+                l_stat = _masked_stat_loss(y_pred, y, z)
             if lambda_depth_grad_t > 0:
                 d_pred = _depth_diff(y_pred)
                 d_true = _depth_diff(y)
@@ -1131,6 +1321,10 @@ def train(train_p: dict):
                 + (lambda_amp_anchor * amp_anchor)
                 + (lambda_region_residual * l_region_res)
                 + (lambda_region_bias * l_region_bias)
+                + (lambda_facies_residual_t * l_facies_res)
+                + (lambda_boundary_band_residual_t * l_bd_res)
+                + (lambda_boundary_band_grad_t * l_bd_grad)
+                + (lambda_masked_stat_t * l_stat)
                 + (lambda_depth_grad_t * l_dgrad)
                 + (lambda_depth_hf_t * l_dhf)
             )

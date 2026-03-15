@@ -772,6 +772,8 @@ def _apply_epoch_budget(train_cfg: dict[str, Any], epochs_override: int | None) 
         "stageB_ramp_epochs",
         "depth_warm_start_epoch",
         "depth_warm_ramp_epochs",
+        "structural_warm_start_epoch",
+        "structural_warm_ramp_epochs",
         "late_multitask_start_epoch",
         "alpha_prior_decay_epochs",
         "boundary_warm_start_epoch",
@@ -790,6 +792,7 @@ def _apply_epoch_budget(train_cfg: dict[str, Any], epochs_override: int | None) 
     train_cfg["stageA_epochs"] = min(int(train_cfg.get("stageA_epochs", 0)), new_epochs)
     train_cfg["stageB_ramp_epochs"] = min(int(train_cfg.get("stageB_ramp_epochs", 0)), new_epochs)
     train_cfg["depth_warm_start_epoch"] = min(int(train_cfg.get("depth_warm_start_epoch", 0)), new_epochs)
+    train_cfg["structural_warm_start_epoch"] = min(int(train_cfg.get("structural_warm_start_epoch", 0)), new_epochs)
     train_cfg["late_multitask_start_epoch"] = min(int(train_cfg.get("late_multitask_start_epoch", 0)), new_epochs)
     train_cfg["alpha_prior_decay_epochs"] = min(int(train_cfg.get("alpha_prior_decay_epochs", new_epochs)), new_epochs)
 
