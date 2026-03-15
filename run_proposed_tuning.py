@@ -156,6 +156,12 @@ STAGE3_R02_WB_BASE: Dict[str, Any] = {
     "boundary_weight_apply_facies": False,
 }
 
+STAGE4_R02_WB_B010_BASE: Dict[str, Any] = {
+    **STAGE3_R02_WB_BASE,
+    "boundary_weight_beta": 0.10,
+    "boundary_beta_end": 0.10,
+}
+
 
 @dataclass(frozen=True)
 class TrialSpec:
@@ -487,6 +493,95 @@ TRIAL_SPECS: Dict[str, TrialSpec] = {
         boundary_weight_beta=0.10,
         boundary_beta_end=0.10,
     ),
+    "s4_r02_wb_b010_facies_ce_only": _trial(
+        stage="stage4",
+        group="region_loss",
+        name="s4_r02_wb_b010_facies_ce_only",
+        suffix="_ptune_s4_r02_b010_ce",
+        base="anchor_r02_wb_b010",
+        note="Stage 4: keep Stage 3 best beta=0.10 and only enable class-weighted facies CE.",
+        use_facies_class_weighted_ce=True,
+        facies_ce_gamma=0.50,
+        facies_ce_min_weight=0.50,
+        facies_ce_max_weight=3.00,
+    ),
+    "s4_r02_wb_b010_region_res": _trial(
+        stage="stage4",
+        group="region_loss",
+        name="s4_r02_wb_b010_region_res",
+        suffix="_ptune_s4_r02_b010_rres",
+        base="anchor_r02_wb_b010",
+        note="Stage 4: add well-only channel/point-bar weighted residual control.",
+        lambda_region_residual=0.10,
+        lambda_region_bias=0.00,
+        region_residual_norm="l1",
+        region_channel_weight=1.00,
+        region_pointbar_weight=1.50,
+    ),
+    "s4_r02_wb_b010_region_res_bias": _trial(
+        stage="stage4",
+        group="region_loss",
+        name="s4_r02_wb_b010_region_res_bias",
+        suffix="_ptune_s4_r02_b010_rres_bias",
+        base="anchor_r02_wb_b010",
+        note="Stage 4: add weighted residual control plus regional bias suppression on wells.",
+        lambda_region_residual=0.10,
+        lambda_region_bias=0.04,
+        region_residual_norm="l1",
+        region_channel_weight=1.00,
+        region_pointbar_weight=1.50,
+    ),
+    "s4_r02_wb_b010_region_res_bias_ce": _trial(
+        stage="stage4",
+        group="region_loss",
+        name="s4_r02_wb_b010_region_res_bias_ce",
+        suffix="_ptune_s4_r02_b010_rres_bias_ce",
+        base="anchor_r02_wb_b010",
+        note="Stage 4: combine regional residual+bias control with class-weighted facies CE.",
+        lambda_region_residual=0.10,
+        lambda_region_bias=0.04,
+        region_residual_norm="l1",
+        region_channel_weight=1.00,
+        region_pointbar_weight=1.50,
+        use_facies_class_weighted_ce=True,
+        facies_ce_gamma=0.50,
+        facies_ce_min_weight=0.50,
+        facies_ce_max_weight=3.00,
+    ),
+    "s4_r02_wb_b010_region_res_bias_ce_pbstrong": _trial(
+        stage="stage4",
+        group="region_loss",
+        name="s4_r02_wb_b010_region_res_bias_ce_pbstrong",
+        suffix="_ptune_s4_r02_b010_rres_bias_ce_pb2",
+        base="anchor_r02_wb_b010",
+        note="Stage 4: same as residual+bias+CE but with stronger point-bar emphasis.",
+        lambda_region_residual=0.10,
+        lambda_region_bias=0.04,
+        region_residual_norm="l1",
+        region_channel_weight=1.00,
+        region_pointbar_weight=2.00,
+        use_facies_class_weighted_ce=True,
+        facies_ce_gamma=0.75,
+        facies_ce_min_weight=0.50,
+        facies_ce_max_weight=3.20,
+    ),
+    "s4_r02_wb_b010_region_res_bias_ce_soft": _trial(
+        stage="stage4",
+        group="region_loss",
+        name="s4_r02_wb_b010_region_res_bias_ce_soft",
+        suffix="_ptune_s4_r02_b010_rres_bias_ce_soft",
+        base="anchor_r02_wb_b010",
+        note="Stage 4: softer regional residual+bias control with class-weighted facies CE.",
+        lambda_region_residual=0.08,
+        lambda_region_bias=0.03,
+        region_residual_norm="l1",
+        region_channel_weight=1.00,
+        region_pointbar_weight=1.75,
+        use_facies_class_weighted_ce=True,
+        facies_ce_gamma=0.50,
+        facies_ce_min_weight=0.50,
+        facies_ce_max_weight=3.00,
+    ),
 }
 
 STAGE_ORDERS: Dict[str, List[str]] = {
@@ -525,8 +620,22 @@ STAGE_ORDERS: Dict[str, List[str]] = {
         "s3_r02_wb_beta005",
         "s3_r02_wb_beta010",
     ],
+    "stage4": [
+        "s4_r02_wb_b010_facies_ce_only",
+        "s4_r02_wb_b010_region_res",
+        "s4_r02_wb_b010_region_res_bias",
+        "s4_r02_wb_b010_region_res_bias_ce",
+        "s4_r02_wb_b010_region_res_bias_ce_pbstrong",
+        "s4_r02_wb_b010_region_res_bias_ce_soft",
+    ],
 }
-STAGE_ORDERS["all"] = STAGE_ORDERS["stage0"] + STAGE_ORDERS["stage1"] + STAGE_ORDERS["stage2"] + STAGE_ORDERS["stage3"]
+STAGE_ORDERS["all"] = (
+    STAGE_ORDERS["stage0"]
+    + STAGE_ORDERS["stage1"]
+    + STAGE_ORDERS["stage2"]
+    + STAGE_ORDERS["stage3"]
+    + STAGE_ORDERS["stage4"]
+)
 
 
 def _jsonable(obj: Any) -> Any:
@@ -632,6 +741,8 @@ def _base_overrides_for_trial(spec: TrialSpec) -> dict[str, Any]:
         base = STAGE2_R02_BASE
     elif spec.base == "anchor_r02_wb":
         base = STAGE3_R02_WB_BASE
+    elif spec.base == "anchor_r02_wb_b010":
+        base = STAGE4_R02_WB_B010_BASE
     else:
         raise ValueError(f"Unknown trial base: {spec.base}")
     out = copy.deepcopy(base)
@@ -912,6 +1023,15 @@ def _build_summary_row(
         "detail_gain": train_cfg.get("detail_gain", ""),
         "use_boundary_weight": int(bool(train_cfg.get("use_boundary_weight", False))),
         "boundary_weight_beta": train_cfg.get("boundary_weight_beta", ""),
+        "lambda_region_residual": train_cfg.get("lambda_region_residual", ""),
+        "lambda_region_bias": train_cfg.get("lambda_region_bias", ""),
+        "region_residual_norm": train_cfg.get("region_residual_norm", ""),
+        "region_channel_weight": train_cfg.get("region_channel_weight", ""),
+        "region_pointbar_weight": train_cfg.get("region_pointbar_weight", ""),
+        "use_facies_class_weighted_ce": int(bool(train_cfg.get("use_facies_class_weighted_ce", False))),
+        "facies_ce_gamma": train_cfg.get("facies_ce_gamma", ""),
+        "facies_ce_min_weight": train_cfg.get("facies_ce_min_weight", ""),
+        "facies_ce_max_weight": train_cfg.get("facies_ce_max_weight", ""),
         "train_noise_kind": train_cfg.get("train_noise_kind", ""),
         "train_noise_prob": train_cfg.get("train_noise_prob", ""),
         "train_noise_snr_db_choices": json.dumps(list(train_cfg.get("train_noise_snr_db_choices", []))),
@@ -1068,7 +1188,8 @@ def _rank_summary_rows(rows: list[dict[str, Any]], mae_tolerance: float, shortli
         row["selection_rank_all"] = idx
 
     shortlisted = set()
-    for stage_name in ("stage1", "stage2"):
+    stage_names = [key for key in STAGE_ORDERS.keys() if key != "all"]
+    for stage_name in stage_names:
         stage_rows = [r for r in ranked_all if r.get("stage") == stage_name]
         for idx, row in enumerate(stage_rows, start=1):
             row[f"selection_rank_{stage_name}"] = idx
@@ -1118,6 +1239,7 @@ def _export_ranked_run_outputs(
     summary_csv = run_root / "trial_summary.csv"
     summary_xlsx = run_root / "trial_summary.xlsx"
     shortlist_json = run_root / "stage1_shortlist.json"
+    preferred_shortlist_json = run_root / "preferred_stage_shortlist.json"
     top_trials_json = run_root / "top_trials.json"
 
     _save_case_json(summary_json, {"rows": summary_rows})
@@ -1145,13 +1267,39 @@ def _export_ranked_run_outputs(
     _save_case_json(shortlist_json, {"shortlist": stage1_shortlist})
 
     preferred_stage = None
-    for stage_name in ("stage2", "stage1"):
+    for stage_name in ("stage4", "stage3", "stage2", "stage1", "stage0"):
         if any(r.get("stage") == stage_name and "mae" in r for r in summary_rows):
             preferred_stage = stage_name
             break
     ranked_visual_rows = sorted(
         [r for r in summary_rows if "mae" in r and str(r.get("stage")) == str(preferred_stage)],
         key=_selection_sort_key,
+    )
+    preferred_shortlist = []
+    for row in ranked_visual_rows[: max(int(shortlist_k), 0)]:
+        preferred_shortlist.append(
+            {
+                "trial_name": row.get("trial_name"),
+                "stage": row.get("stage"),
+                "selection_rank_stage": row.get(f"selection_rank_{preferred_stage}", row.get("selection_rank_all")),
+                "selection_rank_all": row.get("selection_rank_all"),
+                "mae": row.get("mae"),
+                "ssim": row.get("ssim"),
+                "vif": row.get("vif"),
+                "pred_std_ratio": row.get("pred_std_ratio"),
+                "lap_ratio": row.get("lap_ratio"),
+                "q01_gap_abs": row.get("q01_gap_abs"),
+                "q99_gap_abs": row.get("q99_gap_abs"),
+                "note": row.get("note"),
+            }
+        )
+    _save_case_json(
+        preferred_shortlist_json,
+        {
+            "preferred_stage": preferred_stage,
+            "shortlist_k": int(shortlist_k),
+            "shortlist": preferred_shortlist,
+        },
     )
     top_trials = []
     for row in ranked_visual_rows[: max(int(visual_top_k), 0)]:
@@ -1187,7 +1335,7 @@ def _export_ranked_run_outputs(
         },
     )
 
-    required = [summary_json, summary_csv, summary_xlsx, shortlist_json, top_trials_json]
+    required = [summary_json, summary_csv, summary_xlsx, shortlist_json, preferred_shortlist_json, top_trials_json]
     missing = [p.as_posix() for p in required if not p.is_file()]
     if missing:
         raise RuntimeError(f"Missing expected run-summary exports: {missing}")
@@ -1335,6 +1483,7 @@ def run_trials(
     )
     print(f"[SAVE] summary -> {(run_root / 'trial_summary.xlsx').as_posix()}")
     print(f"[SAVE] shortlist -> {(run_root / 'stage1_shortlist.json').as_posix()}")
+    print(f"[SAVE] preferred shortlist -> {(run_root / 'preferred_stage_shortlist.json').as_posix()}")
     print(f"[SAVE] visual top trials -> {(run_root / 'top_trials.json').as_posix()}")
 
 
@@ -1395,6 +1544,7 @@ def postprocess_run_outputs(
     )
     print(f"[POSTPROCESS] summary -> {(run_root / 'trial_summary.xlsx').as_posix()}")
     print(f"[POSTPROCESS] shortlist -> {(run_root / 'stage1_shortlist.json').as_posix()}")
+    print(f"[POSTPROCESS] preferred shortlist -> {(run_root / 'preferred_stage_shortlist.json').as_posix()}")
     print(f"[POSTPROCESS] visual top trials -> {(run_root / 'top_trials.json').as_posix()}")
 
 
@@ -1406,7 +1556,7 @@ def parse_args() -> argparse.Namespace:
         "--stage",
         type=str,
         default="all",
-        choices=["stage0", "stage1", "stage2", "stage3", "all"],
+        choices=["stage0", "stage1", "stage2", "stage3", "stage4", "all"],
         help="Which stage set to run.",
     )
     parser.add_argument(

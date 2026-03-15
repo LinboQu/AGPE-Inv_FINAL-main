@@ -501,7 +501,34 @@ def train(train_p: dict):
     # losses
     criterion_ai = torch.nn.MSELoss()
     criterion_rec = torch.nn.MSELoss()
-    criterion_facies = nn.CrossEntropyLoss()
+    use_facies_class_weighted_ce = bool(train_p.get("use_facies_class_weighted_ce", False))
+    facies_ce_gamma = float(train_p.get("facies_ce_gamma", 0.5))
+    facies_ce_min_weight = float(train_p.get("facies_ce_min_weight", 0.5))
+    facies_ce_max_weight = float(train_p.get("facies_ce_max_weight", 4.0))
+    facies_ce_manual_weights = train_p.get("facies_ce_manual_weights", None)
+
+    def _build_facies_ce_weight() -> torch.Tensor | None:
+        facies_n = int(train_p.get("facies_n", 4))
+        if facies_ce_manual_weights not in (None, "", []):
+            arr = np.asarray(facies_ce_manual_weights, dtype=np.float32).reshape(-1)
+            if arr.size != facies_n:
+                raise ValueError(
+                    f"facies_ce_manual_weights size mismatch: expected {facies_n}, got {arr.size}"
+                )
+            return torch.tensor(arr, device=device, dtype=torch.float32)
+        if not use_facies_class_weighted_ce:
+            return None
+        fac3d = np.asarray(meta["facies3d"], dtype=np.int64)
+        counts = np.bincount(fac3d.reshape(-1), minlength=facies_n).astype(np.float64)
+        counts = np.maximum(counts, 1.0)
+        weights = counts ** (-float(facies_ce_gamma))
+        weights = weights / max(weights.mean(), 1e-8)
+        weights = np.clip(weights, float(facies_ce_min_weight), float(facies_ce_max_weight))
+        weights = weights / max(weights.mean(), 1e-8)
+        return torch.tensor(weights.astype(np.float32), device=device, dtype=torch.float32)
+
+    facies_ce_weight = _build_facies_ce_weight()
+    criterion_facies = nn.CrossEntropyLoss(weight=facies_ce_weight)
 
     lam_ai = float(train_p.get("lambda_ai", 5.0))
     lam_fac = float(train_p.get("lambda_facies", 0.2))
@@ -513,6 +540,13 @@ def train(train_p: dict):
     stageA_lambda_facies_mult = float(train_p.get("stageA_lambda_facies_mult", 0.30))
     stageA_lambda_recon_mult = float(train_p.get("stageA_lambda_recon_mult", 0.30))
     lambda_amp_anchor = float(train_p.get("lambda_amp_anchor", 0.05))
+    lambda_region_residual = float(train_p.get("lambda_region_residual", 0.0))
+    lambda_region_bias = float(train_p.get("lambda_region_bias", 0.0))
+    region_residual_norm = str(train_p.get("region_residual_norm", "l1")).strip().lower()
+    region_channel_id = int(train_p.get("region_channel_id", train_p.get("channel_id", 2)))
+    region_pointbar_id = int(train_p.get("region_pointbar_id", 1))
+    region_channel_weight = float(train_p.get("region_channel_weight", 1.0))
+    region_pointbar_weight = float(train_p.get("region_pointbar_weight", 1.5))
     # Depth-detail preservation to suppress over-layered smoothing.
     lambda_depth_grad = float(train_p.get("lambda_depth_grad", 0.20))
     lambda_depth_hf = float(train_p.get("lambda_depth_hf", 0.10))
@@ -553,6 +587,15 @@ def train(train_p: dict):
     print(
         f"[TRAIN-NOISE] kind={train_noise_kind} prob={train_noise_prob:.3f} "
         f"snrs={train_noise_snr_db_choices} r_channel_dropout_prob={r_channel_dropout_prob:.3f}"
+    )
+    if facies_ce_weight is not None:
+        print(f"[FACIES-CE] weighted=1 gamma={facies_ce_gamma:.3f} weights={facies_ce_weight.detach().cpu().tolist()}")
+    else:
+        print("[FACIES-CE] weighted=0")
+    print(
+        f"[REGION-LOSS] lambda_res={lambda_region_residual:.4f} lambda_bias={lambda_region_bias:.4f} "
+        f"norm={region_residual_norm} channel_id={region_channel_id} pointbar_id={region_pointbar_id} "
+        f"channel_w={region_channel_weight:.3f} pointbar_w={region_pointbar_weight:.3f}"
     )
 
     optimizer = torch.optim.Adam(
@@ -689,6 +732,9 @@ def train(train_p: dict):
             return torch.mean((pred - target) ** 2)
         return torch.mean(torch.abs(pred - target))
 
+    def _facies_ce_map(logits: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(logits, z_label, reduction="none", weight=facies_ce_weight)
+
     def _build_boundary_weight(z_label: torch.Tensor, beta: float) -> torch.Tensor:
         """
         z_label: [B,H] or [B,1,H] int facies labels
@@ -712,6 +758,48 @@ def train(train_p: dict):
         if float(boundary_weight_max) > 1.0:
             w = w.clamp(max=float(boundary_weight_max))
         return w
+
+    def _region_weight_map(z_label: torch.Tensor) -> torch.Tensor:
+        z2 = z_label.squeeze(1) if z_label.dim() == 3 else z_label
+        if z2.dim() != 2:
+            raise ValueError(f"Expected z_label dim=2/3, got shape={tuple(z_label.shape)}")
+        w = torch.zeros_like(z2, dtype=torch.float32)
+        if float(region_channel_weight) > 0.0:
+            w = w + (z2 == int(region_channel_id)).float() * float(region_channel_weight)
+        if float(region_pointbar_weight) > 0.0:
+            w = w + (z2 == int(region_pointbar_id)).float() * float(region_pointbar_weight)
+        return w
+
+    def _region_residual_loss(pred: torch.Tensor, target: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
+        reg_w = _region_weight_map(z_label)
+        if float(reg_w.sum().detach().item()) <= 0.0:
+            return pred.new_zeros(())
+        if region_residual_norm == "l2":
+            err = (pred - target) ** 2
+        else:
+            err = torch.abs(pred - target)
+        return (err * reg_w.unsqueeze(1)).sum() / (reg_w.sum() + 1e-8)
+
+    def _region_bias_loss(pred: torch.Tensor, target: torch.Tensor, z_label: torch.Tensor) -> torch.Tensor:
+        z2 = z_label.squeeze(1) if z_label.dim() == 3 else z_label
+        res = (pred - target).squeeze(1)
+        numer = pred.new_zeros(())
+        denom = pred.new_zeros(())
+        for cls_id, cls_w in (
+            (int(region_channel_id), float(region_channel_weight)),
+            (int(region_pointbar_id), float(region_pointbar_weight)),
+        ):
+            if cls_w <= 0.0:
+                continue
+            mask = (z2 == cls_id).float()
+            if float(mask.sum().detach().item()) <= 0.0:
+                continue
+            cls_bias = torch.abs((res * mask).sum() / (mask.sum() + 1e-8))
+            numer = numer + (cls_bias * float(cls_w))
+            denom = denom + float(cls_w)
+        if float(denom.detach().item()) <= 0.0:
+            return pred.new_zeros(())
+        return numer / (denom + 1e-8)
 
     def _weighted_reduce(err_map: torch.Tensor, weight_map: torch.Tensor | None) -> torch.Tensor:
         if weight_map is None:
@@ -907,6 +995,7 @@ def train(train_p: dict):
                 f"lam_ai={lam_ai_t:.3f} lam_fac={lam_fac_t:.3f} lam_rec={lam_rec_t:.3f} "
                 f"ws_every={ws_every_t} ws_max_batches={ws_cap_t} lambda_amp_anchor={lambda_amp_anchor:.4f} "
                 f"lambda_depth_grad={lambda_depth_grad_t:.4f} lambda_depth_hf={lambda_depth_hf_t:.4f} "
+                f"lambda_region_residual={lambda_region_residual:.4f} lambda_region_bias={lambda_region_bias:.4f} "
                 f"boundary_weight={int(use_boundary_weight)} beta={boundary_beta_t:.2f} width={boundary_weight_width} "
                 f"facies_detach={int(fac_detach_t)} late_decouple={int(_is_late_multitask(epoch))}"
             )
@@ -989,13 +1078,19 @@ def train(train_p: dict):
                 l_ai = criterion_ai(y_pred, y)
 
             if (boundary_w is not None) and boundary_weight_apply_facies:
-                ce_map = F.cross_entropy(fac_logits, z, reduction="none")  # [B,H]
+                ce_map = _facies_ce_map(fac_logits, z)  # [B,H]
                 l_fac = _weighted_reduce(ce_map, boundary_w)
             else:
                 l_fac = criterion_facies(fac_logits, z)
             l_rec = criterion_rec(x_rec, x[:, 0:1, :])
+            l_region_res = torch.tensor(0.0, device=device)
+            l_region_bias = torch.tensor(0.0, device=device)
             l_dgrad = torch.tensor(0.0, device=device)
             l_dhf = torch.tensor(0.0, device=device)
+            if lambda_region_residual > 0:
+                l_region_res = _region_residual_loss(y_pred, y, z)
+            if lambda_region_bias > 0:
+                l_region_bias = _region_bias_loss(y_pred, y, z)
             if lambda_depth_grad_t > 0:
                 d_pred = _depth_diff(y_pred)
                 d_true = _depth_diff(y)
@@ -1034,6 +1129,8 @@ def train(train_p: dict):
                 + (lam_fac_t * l_fac)
                 + (lam_rec_t * l_rec)
                 + (lambda_amp_anchor * amp_anchor)
+                + (lambda_region_residual * l_region_res)
+                + (lambda_region_bias * l_region_bias)
                 + (lambda_depth_grad_t * l_dgrad)
                 + (lambda_depth_hf_t * l_dhf)
             )
